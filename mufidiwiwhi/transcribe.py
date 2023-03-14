@@ -35,7 +35,7 @@ from whisper.utils import (
     optional_int,
     str2bool,
 )
-from utils import (
+from .utils import (
     get_writer,
 )
 from whisper import available_models
