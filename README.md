@@ -1,15 +1,16 @@
 # Mufidiwiwhi
 
-Mufidiwhiwi (Multi-file diarization with Whisper) is a tiny program using [Whisper](https://github.com/openai/whisper).
+Mufidiwhiwi (Multi-file diarization with Whisper) is a tiny, **quick-and-dirty** program using [Whisper](https://github.com/openai/whisper).
 
-It will transcript audio files with reliable diarization, using one file per speaker: Mufidiwhiwi requires that you record all speaker in a separate file.  
-In order to do that, you can [use Mumble to record a podcast with guests](https://blog.castopod.org/use-mumble-to-record-a-podcast-with-guests/) or use [Ardour DAW](https://ardour.org/) to [record a Podcast with several remote guests](https://blog.castopod.org/how-to-record-a-podcast-with-several-remote-guests/) (you can also use [Zrythm](https://blog.castopod.org/how-to-record-a-podcast-with-zrythm/)).
+It will transcript audio files with reliable [speaker diarization](https://en.wikipedia.org/wiki/Speaker_diarisation), by using **one file per speaker**: Mufidiwhiwi requires that you record each speaker in a separate file.  
+In order to do that, you can [use Mumble to record a podcast with guests](https://blog.castopod.org/use-mumble-to-record-a-podcast-with-guests/) or use [Ardour DAW](https://ardour.org/) to [record a Podcast with several remote guests](https://blog.castopod.org/how-to-record-a-podcast-with-several-remote-guests/) (you can also use [Zrythm](https://blog.castopod.org/how-to-record-a-podcast-with-zrythm/)).  
+This will create 100% accurate diarization.
 
 Of course, you should run Mufidiwhiwi before merging all audio files together.
 
 ## Setup
 
-You need Whisper and [Pydub](http://pydub.com/) installed.
+You need [Whisper](https://github.com/openai/whisper) and [Pydub](http://pydub.com/) installed.
 
     pip install --upgrade --no-deps --force-reinstall git+https://github.com/openai/whisper.git
     pip install pydub
