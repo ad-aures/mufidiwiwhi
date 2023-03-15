@@ -8,6 +8,10 @@ This will create 100% accurate diarization.
 
 Of course, you should run Mufidiwhiwi before merging all audio files together.
 
+More information: [Transcribe your Podcast with accurate speaker diarisation, for free, with Whisper](https://blog.castopod.org/transcribe-your-podcast-with-accurate-speaker-diarisation-for-free-with-whisper/)
+
+Make sure that you choose a [podcast hosting platform that supports transcripts](https://podcastindex.org/apps?appTypes=hosting&elements=Transcript) (such as [Castopod](https://castopod.org/)!).
+
 ## Setup
 
 You need [Whisper](https://github.com/openai/whisper) and [Pydub](http://pydub.com/) installed.
