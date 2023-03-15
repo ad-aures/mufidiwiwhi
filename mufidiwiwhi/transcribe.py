@@ -41,7 +41,6 @@ from .utils import (
 from whisper import available_models
 
 MIN_SILENCE_LEN = 500             # silence longer than MIN_SILENCE_LEN ms will be trimed
-CUT_SILENCE_LEN = 1000            # Will cut every time a CUT_SILENCE_LEN ms silence is detected
 SEEK_STEP = 50                    # search for silence every SEEK_STEP ms
 DBFS_THRESHOLD = 40               # cuts every time dbFS falls DBFS_THRESHOLD db under
 MIN_CHUNK_LEN = 700               # each chunk must be longer than MIN_CHUNK_LEN ms
