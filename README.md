@@ -1,10 +1,10 @@
 # Mufidiwiwhi
 
-Mufidiwhiwi (Multi-file diarization with Whisper) is a tiny, **quick-and-dirty** program using [Whisper](https://github.com/openai/whisper).
+Mufidiwhiwi (Multi-file diarisation with Whisper) is a tiny, **quick-and-dirty** program using [Whisper](https://github.com/openai/whisper).
 
-It will transcript audio files with reliable [speaker diarization](https://en.wikipedia.org/wiki/Speaker_diarisation), by using **one file per speaker**: Mufidiwhiwi requires that you record each speaker in a separate file.  
+It will transcript audio files with reliable [speaker diarisation](https://en.wikipedia.org/wiki/Speaker_diarisation), by using **one file per speaker**: Mufidiwhiwi requires that you record each speaker in a separate file.  
 In order to do that, you can [use Mumble to record a podcast with guests](https://blog.castopod.org/use-mumble-to-record-a-podcast-with-guests/) or use [Ardour DAW](https://ardour.org/) to [record a Podcast with several remote guests](https://blog.castopod.org/how-to-record-a-podcast-with-several-remote-guests/) (you can also use [Zrythm](https://blog.castopod.org/how-to-record-a-podcast-with-zrythm/)).  
-This will create 100% accurate diarization.
+This will create 100% accurate diarisation.
 
 Of course, you should run Mufidiwhiwi before merging all audio files together.
 
