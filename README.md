@@ -18,7 +18,7 @@ You need [Whisper](https://github.com/openai/whisper) and [Pydub](http://pydub.c
 
     pip install --upgrade --no-deps --force-reinstall git+https://github.com/openai/whisper.git
     pip install pydub
-    pip install git+https://github.com/adaures/mufidiwhiwi.git
+    pip install git+https://github.com/ad-aures/mufidiwhiwi.git
 
 ## Command-line usage
 
