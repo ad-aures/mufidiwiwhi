@@ -48,14 +48,23 @@ class WriteSpeakerSRT(SubtitlesWriter):
     always_include_hours: bool = True
     decimal_marker: str = ","
 
-    def write_result(self, result: dict, file: TextIO):
+    def write_result(self, result: dict, file: TextIO, options: dict = None):
         for i, (start, end, text, speaker) in enumerate(self.iterate_result(result), start=1):
             print(f"{i}\n{start} --> {end}\n[{speaker}] {text}\n", file=file, flush=True) 
+
+class WriteSpeakerVTT(SubtitlesWriter):
+    extension: str = "vtt"
+    always_include_hours: bool = True
+    decimal_marker: str = ","
+
+    def write_result(self, result: dict, file: TextIO, options: dict = None):
+        for i, (start, end, text, speaker) in enumerate(self.iterate_result(result), start=1):
+            print(f"{i}\n{start} --> {end}\n<{speaker}>{text}\n", file=file, flush=True)
 
 def get_writer(output_format: str, output_dir: str) -> Callable[[dict, TextIO], None]:
     writers = {
         "txt": WriteTXT,
-        "vtt": WriteVTT,
+        "vtt": WriteSpeakerVTT,
         "srt": WriteSpeakerSRT,
         "tsv": WriteTSV,
         "json": WriteJSON,
