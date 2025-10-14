@@ -1,2 +1,5 @@
-whisper
-pydub
+openai-whisper
+audioop-lts
+numpy
+torch
+tqdm
