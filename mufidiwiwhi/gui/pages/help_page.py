@@ -132,6 +132,10 @@ class HelpPage(QWidget):
         self._view.setObjectName("helpView")
         self._view.setOpenExternalLinks(True)
         self._view.setFrameShape(QTextBrowser.Shape.NoFrame)
+        self._view.setStyleSheet(
+            "QTextBrowser { background: transparent; }"
+        )
+        self._view.viewport().setAutoFillBackground(False)
         self._view.document().setDefaultStyleSheet(
             "p, li { line-height: 1.45; }"
             "table { border-collapse: collapse; }"
