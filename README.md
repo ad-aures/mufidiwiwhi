@@ -79,13 +79,6 @@ A plain-text dictionary of proper nouns and domain terms can be used to correct 
         --dictionary vocab.txt \
         --phonetic-lang fr --phonetic-lang-secondary en
 
-An optional second pass uses an [Ollama](https://ollama.com) model:
-
-    mufidiwiwhi Alice a.wav Bob b.wav --dictionary vocab.txt \
-        --llm-correct qwen2.5:7b
-
-If Ollama is unreachable, the LLM pass is skipped and the phonetic output is kept.
-
 ## GUI
 
 A PyQt6 GUI is available via the `mufidiwiwhi-gui` console script. It exposes the same functionality as the CLI in a tabbed window (Setup, Project, Run). Settings persist via `QSettings`.
@@ -121,7 +114,6 @@ Build / dev:
 External tools:
 
 - [ffmpeg](https://ffmpeg.org/) &mdash; audio decoding (must be on `PATH`).
-- [Ollama](https://ollama.com/) &mdash; optional LLM second-pass corrector.
 
 ## Credits
 

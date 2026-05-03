@@ -36,6 +36,4 @@ Run after every meaningful change to `mufidiwiwhi/gui/`.
 
 ## Failure paths
 
-18. With Ollama not running, click "Test connection" on Setup; the button shows "Failed: ..." rather than crashing.
-19. Set `--llm-correct` to a non-existent model; the LLM pass logs a warning and the phonetic output is preserved.
-20. Provide a non-existent audio file; the run completes with an error in the log; the GUI does not crash.
+18. Provide a non-existent audio file; the run completes with an error in the log; the GUI does not crash.

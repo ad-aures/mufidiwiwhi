@@ -214,13 +214,9 @@ class SettingsManager:
     # `[global]` section of the INI file but that no longer exist.
     # Pruned on every save to keep the file tidy.
     _OBSOLETE_GLOBAL_KEYS = (
-        "ollama_url",
-        "ollama_model",
         "default_output_dir",
         "default_output_formats",
         "default_dictionary",
-        "enable_llm",
-        "llm_only",
     )
 
     def save_global(self, gs: GlobalSettings) -> None:
