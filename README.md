@@ -12,6 +12,8 @@
 
 Or grab the binary from the [releases page](https://codeberg.org/adaures/mufidiwiwhi/releases).
 
+Downloadable builds for **macOS**, **Windows**, and **Flatpak** are coming soon.
+
 Mufidiwiwhi (Multi-file diarisation with Whisper) is a tiny, **quick-and-dirty** program built on top of [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
 It transcribes audio with reliable [speaker diarisation](https://en.wikipedia.org/wiki/Speaker_diarisation), by using **one file per speaker**: Mufidiwiwhi requires that you record each speaker in a separate file.
@@ -50,9 +52,19 @@ To get help, type
 
     mufidiwiwhi --help
 
-Example:
+Example with four speakers, French audio, GPU inference, SRT output, and both phonetic + Hunspell post-correction:
 
-    mufidiwiwhi Lucy interview_lucy.wav Samir interview_samir.wav Rachel interview_rachel.wav --model large-v3 --language fr
+    mufidiwiwhi 'Aïcha' 'tracks/Aïcha.wav' Bob tracks/Bob.wav Guests tracks/Guests.wav 'Thème' 'tracks/Thème.wav' \
+        --model medium --model_dir ~/.cache/huggingface/hub \
+        --device cuda --compute_type auto \
+        --language fr \
+        --output_format srt --output_dir . --output_filename episode01 \
+        --dictionary ~/.config/mufidiwiwhi/dictionary.txt \
+        --phonetic-lang fr --phonetic-lang-secondary en \
+        --hunspell-primary /usr/share/hunspell/fr_FR \
+        --hunspell-secondary /usr/share/hunspell/en_US
+
+The GUI's Project tab has a **Copy CLI command** button that prints the full equivalent of whatever you set up in the GUI, which is the easiest way to learn the CLI flags.
 
 You can also point Mufidiwiwhi at an Audacity `.aup3` project; each track is extracted to a 16 kHz mono WAV in a temp folder, the speaker name comes from the Audacity track name, and the temp folder is cleaned up when the app exits:
 
@@ -85,9 +97,15 @@ A PyQt6 GUI is available via the `mufidiwiwhi-gui` console script. It exposes th
 
     mufidiwiwhi-gui
 
+Add `-v` / `--verbose` to mirror per-chunk timing, replacement decisions, and Hunspell pathology warnings to the launching terminal.
+
+    mufidiwiwhi-gui --verbose
+
 The GUI also accepts the same arguments as the CLI to prefill the project tab:
 
     mufidiwiwhi-gui Lucy interview_lucy.wav Samir interview_samir.wav --dictionary vocab.txt
+
+The Project tab has a **Copy CLI command** button that emits the full `mufidiwiwhi ...` invocation matching the current GUI state — the fastest way to learn the CLI flags.
 
 A PyInstaller spec is provided in `packaging/` for single-file Linux distribution.
 
