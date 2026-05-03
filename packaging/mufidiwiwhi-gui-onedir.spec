@@ -52,7 +52,7 @@ EXCLUDES = [
 ]
 
 a = Analysis(
-    [os.path.join(PROJECT_ROOT, "mufidiwiwhi", "gui", "app.py")],
+    [os.path.join(SPECPATH, "launcher.py")],
     pathex=[PROJECT_ROOT],
     binaries=[],
     datas=DATAS,
