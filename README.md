@@ -26,6 +26,13 @@ More information: [Transcribe your Podcast with accurate speaker diarisation, fo
 
 Make sure that you choose a [podcast hosting platform that supports transcripts](https://podcastindex.org/apps?appTypes=hosting&elements=Transcript) (such as [Castopod](https://castopod.org/)!).
 
+## Screenshots
+
+| Settings | Project | Run |
+| :---: | :---: | :---: |
+| ![Settings tab](docs/screenshots/settings.png) | ![Project tab](docs/screenshots/project.png) | ![Run tab](docs/screenshots/run.png) |
+| Whisper model, device, language, and correction thresholds. | One file per speaker, output formats, chapters from the Audacity project. | Live log with per-segment progress, timing, and replacement decisions. |
+
 ## Setup
 
 Mufidiwiwhi requires Python 3.10 or newer. The transcription engine is `faster-whisper`, which uses CTranslate2 for inference (4 to 8 times faster than `openai-whisper` on CPU). `ffmpeg` must be available on the PATH.
