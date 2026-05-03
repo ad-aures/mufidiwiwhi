@@ -6,7 +6,11 @@
 
 **v2.0.0 &mdash; now with a GUI.** See [DOCS.md](DOCS.md) for the user manual (what it does, how the corrector works, recommended settings, hardware, privacy).
 
-**Download the latest release:** [codeberg.org/adaures/mufidiwiwhi/releases](https://codeberg.org/adaures/mufidiwiwhi/releases)
+**Install on Ubuntu / Debian:**
+
+    curl -fsSL https://codeberg.org/adaures/mufidiwiwhi/raw/branch/main/install_ubuntu.sh | bash
+
+Or grab the binary from the [releases page](https://codeberg.org/adaures/mufidiwiwhi/releases).
 
 Mufidiwiwhi (Multi-file diarisation with Whisper) is a tiny, **quick-and-dirty** program built on top of [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
@@ -28,23 +32,17 @@ Mufidiwiwhi requires Python 3.10 or newer. The transcription engine is `faster-w
 
 This installs both the `mufidiwiwhi` CLI and the `mufidiwiwhi-gui` GUI. All runtime dependencies (faster-whisper, PyQt6, the phonetic libraries, httpx) are pulled in automatically.
 
-### Ubuntu installer (uses a PyInstaller binary)
+### Ubuntu / Debian one-liner
 
-Build the standalone GUI binary first:
+Pulls the latest release from Codeberg, drops the binary in `~/.local/bin`, registers the icon and an apps-menu entry. No sudo, no system packages.
 
-    pyinstaller packaging/mufidiwiwhi-gui-onefile.spec --noconfirm
+    curl -fsSL https://codeberg.org/adaures/mufidiwiwhi/raw/branch/main/install_ubuntu.sh | bash
 
-Then install the binary, the icon, and an application-menu entry under `~/.local`:
+To uninstall, remove these three files:
 
-    ./install_ubuntu.sh
-
-The script never touches system packages and never asks for sudo. To install from a release URL instead of `./dist`:
-
-    ./install_ubuntu.sh --url https://example.com/mufidiwiwhi-gui-linux.tar.gz
-
-To uninstall:
-
-    ./install_ubuntu.sh --uninstall
+    ~/.local/bin/mufidiwiwhi-gui
+    ~/.local/share/icons/hicolor/scalable/apps/mufidiwiwhi.svg
+    ~/.local/share/applications/mufidiwiwhi-gui.desktop
 
 ## Command-line usage
 

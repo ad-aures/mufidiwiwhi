@@ -1,165 +1,81 @@
 #!/usr/bin/env bash
-# Install Mufidiwiwhi GUI from a PyInstaller-built binary.
+# Install the Mufidiwiwhi GUI on Ubuntu / Debian-style systems.
 #
-# Usage:
-#   ./install_ubuntu.sh                  # install from ./dist (default)
-#   ./install_ubuntu.sh --url URL        # download a binary or tarball
-#   ./install_ubuntu.sh --uninstall      # remove the launcher and binary
+# Pulls the latest published release from Codeberg, copies the
+# binary to ~/.local/bin, drops an icon and a .desktop entry under
+# ~/.local/share. No sudo, no system packages.
 #
-# The script never installs system packages and never asks for sudo;
-# everything goes under $HOME (~/.local). Re-running is safe.
+# One-liner:
+#   curl -fsSL https://codeberg.org/adaures/mufidiwiwhi/raw/branch/main/install_ubuntu.sh | bash
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_NAME="mufidiwiwhi-gui"
-INSTALL_BIN_DIR="$HOME/.local/bin"
-INSTALL_LIB_DIR="$HOME/.local/share/mufidiwiwhi"
+REPO="adaures/mufidiwiwhi"
+API="https://codeberg.org/api/v1/repos/$REPO/releases/latest"
+ICON_URL="https://codeberg.org/$REPO/raw/branch/main/mufidiwiwhi.svg"
+APP="mufidiwiwhi-gui"
+BIN_DIR="$HOME/.local/bin"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
 DESKTOP_DIR="$HOME/.local/share/applications"
-ICON_SRC="$REPO_ROOT/mufidiwiwhi.svg"
-DESKTOP_SRC="$REPO_ROOT/packaging/mufidiwiwhi.desktop"
-
-URL=""
-DO_UNINSTALL=0
-for arg in "$@"; do
-    case "$arg" in
-        --url=*)      URL="${arg#--url=}" ;;
-        --url)        shift; URL="${1:-}" ;;
-        --uninstall)  DO_UNINSTALL=1 ;;
-        -h|--help)
-            sed -n '2,9p' "$0"
-            exit 0
-            ;;
-        *)
-            echo "Unknown argument: $arg" >&2
-            exit 2
-            ;;
-    esac
-done
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m!! \033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m!! \033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m!!\033[0m %s\n' "$*" >&2; exit 1; }
 
-# ---------------------------------------------------------------------------
-# Uninstall
-# ---------------------------------------------------------------------------
-if [[ "$DO_UNINSTALL" -eq 1 ]]; then
-    log "Removing launcher and binary"
-    rm -f "$DESKTOP_DIR/$APP_NAME.desktop"
-    rm -f "$ICON_DIR/mufidiwiwhi.svg"
-    rm -f "$INSTALL_BIN_DIR/$APP_NAME"
-    rm -rf "$INSTALL_LIB_DIR"
-    command -v update-desktop-database >/dev/null 2>&1 \
-        && update-desktop-database "$DESKTOP_DIR" || true
-    command -v gtk-update-icon-cache >/dev/null 2>&1 \
-        && gtk-update-icon-cache -t "$HOME/.local/share/icons/hicolor" || true
-    log "Done."
-    exit 0
-fi
+command -v curl >/dev/null 2>&1 || die "curl is required."
+command -v python3 >/dev/null 2>&1 || die "python3 is required."
 
-# ---------------------------------------------------------------------------
-# Pick the source: --url, or local ./dist
-# ---------------------------------------------------------------------------
-SRC=""
-TMPDIR=""
-cleanup() { [[ -n "$TMPDIR" && -d "$TMPDIR" ]] && rm -rf "$TMPDIR"; }
-trap cleanup EXIT
+log "Resolving latest release"
+JSON="$(curl -fsSL "$API")" || die "Could not reach $API"
 
-if [[ -n "$URL" ]]; then
-    log "Downloading $URL"
-    TMPDIR="$(mktemp -d)"
-    DOWNLOAD="$TMPDIR/download"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fL --progress-bar "$URL" -o "$DOWNLOAD"
-    elif command -v wget >/dev/null 2>&1; then
-        wget --show-progress -O "$DOWNLOAD" "$URL"
-    else
-        die "Neither curl nor wget is available."
-    fi
-    case "$URL" in
-        *.tar.gz|*.tgz)
-            log "Extracting tarball"
-            tar -xzf "$DOWNLOAD" -C "$TMPDIR"
-            SRC="$(find "$TMPDIR" -maxdepth 4 -type f -name "$APP_NAME" | head -n 1)"
-            [[ -z "$SRC" ]] && SRC="$(find "$TMPDIR" -maxdepth 4 -type d -name "$APP_NAME" | head -n 1)"
-            ;;
-        *.zip)
-            log "Extracting zip"
-            command -v unzip >/dev/null 2>&1 || die "unzip is required for .zip URLs."
-            unzip -q "$DOWNLOAD" -d "$TMPDIR"
-            SRC="$(find "$TMPDIR" -maxdepth 4 -type f -name "$APP_NAME" | head -n 1)"
-            [[ -z "$SRC" ]] && SRC="$(find "$TMPDIR" -maxdepth 4 -type d -name "$APP_NAME" | head -n 1)"
-            ;;
-        *)
-            SRC="$DOWNLOAD"
-            ;;
-    esac
-else
-    if [[ -f "$REPO_ROOT/dist/$APP_NAME" ]]; then
-        SRC="$REPO_ROOT/dist/$APP_NAME"             # one-file build
-    elif [[ -d "$REPO_ROOT/dist/$APP_NAME" ]]; then
-        SRC="$REPO_ROOT/dist/$APP_NAME"             # one-folder build
-    else
-        die "No prebuilt binary found in $REPO_ROOT/dist. Build it first with:
-        pyinstaller packaging/mufidiwiwhi-gui-onefile.spec --noconfirm
-or pass --url URL to fetch a release artefact."
-    fi
-fi
+read -r TAG ASSET_URL ASSET_NAME < <(python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+tag = data.get("tag_name", "")
+for a in data.get("assets") or []:
+    name = a.get("name", "")
+    if name.endswith("-linux-x86_64"):
+        print(tag, a.get("browser_download_url", ""), name)
+        break
+' "$JSON")
 
-[[ -e "$SRC" ]] || die "Source not found after download: $SRC"
+[[ -n "${ASSET_URL:-}" ]] || die "No *-linux-x86_64 asset on the latest release."
 
-# ---------------------------------------------------------------------------
-# Install
-# ---------------------------------------------------------------------------
-mkdir -p "$INSTALL_BIN_DIR" "$INSTALL_LIB_DIR" "$ICON_DIR" "$DESKTOP_DIR"
+mkdir -p "$BIN_DIR" "$ICON_DIR" "$DESKTOP_DIR"
 
-EXEC_PATH=""
-if [[ -f "$SRC" ]]; then
-    log "Installing single-file binary to $INSTALL_BIN_DIR/$APP_NAME"
-    install -m 0755 "$SRC" "$INSTALL_BIN_DIR/$APP_NAME"
-    EXEC_PATH="$INSTALL_BIN_DIR/$APP_NAME"
-else
-    log "Installing single-folder bundle to $INSTALL_LIB_DIR"
-    rm -rf "$INSTALL_LIB_DIR"
-    cp -a "$SRC" "$INSTALL_LIB_DIR"
-    [[ -f "$INSTALL_LIB_DIR/$APP_NAME" ]] || die "Bundle missing $APP_NAME at $INSTALL_LIB_DIR"
-    chmod +x "$INSTALL_LIB_DIR/$APP_NAME"
-    log "Symlinking $INSTALL_BIN_DIR/$APP_NAME -> $INSTALL_LIB_DIR/$APP_NAME"
-    ln -sf "$INSTALL_LIB_DIR/$APP_NAME" "$INSTALL_BIN_DIR/$APP_NAME"
-    EXEC_PATH="$INSTALL_LIB_DIR/$APP_NAME"
-fi
+log "Downloading $ASSET_NAME"
+curl -fL --progress-bar "$ASSET_URL" -o "$BIN_DIR/$APP"
+chmod +x "$BIN_DIR/$APP"
 
-if [[ -f "$ICON_SRC" ]]; then
-    log "Installing icon to $ICON_DIR/mufidiwiwhi.svg"
-    install -m 0644 "$ICON_SRC" "$ICON_DIR/mufidiwiwhi.svg"
-else
-    warn "Icon source not found at $ICON_SRC; launcher will use the default icon."
-fi
+log "Downloading icon"
+curl -fsSL "$ICON_URL" -o "$ICON_DIR/mufidiwiwhi.svg" \
+    || warn "Icon download failed; launcher will use the default icon."
 
-if [[ -f "$DESKTOP_SRC" ]]; then
-    log "Installing launcher to $DESKTOP_DIR/$APP_NAME.desktop"
-    sed -e "s|^Exec=.*|Exec=$EXEC_PATH %F|" \
-        -e "s|^Icon=.*|Icon=mufidiwiwhi|" \
-        "$DESKTOP_SRC" \
-        > "$DESKTOP_DIR/$APP_NAME.desktop"
-    chmod 0644 "$DESKTOP_DIR/$APP_NAME.desktop"
-else
-    warn "Desktop template missing at $DESKTOP_SRC; you will not get a launcher entry."
-fi
+log "Writing launcher"
+cat > "$DESKTOP_DIR/$APP.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Mufidiwiwhi
+Comment=Multi-speaker podcast transcription
+Exec=$BIN_DIR/$APP %F
+Icon=mufidiwiwhi
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+MimeType=audio/wav;audio/flac;audio/mpeg;audio/ogg;
+StartupWMClass=$APP
+EOF
+chmod 0644 "$DESKTOP_DIR/$APP.desktop"
 
-# Refresh caches if the helpers are present (these never fail the install).
 command -v update-desktop-database >/dev/null 2>&1 \
     && update-desktop-database "$DESKTOP_DIR" || true
 command -v gtk-update-icon-cache >/dev/null 2>&1 \
     && gtk-update-icon-cache -t "$HOME/.local/share/icons/hicolor" || true
 
-log "Done."
+log "Installed $TAG to $BIN_DIR/$APP"
 echo
-echo "  Binary:   $EXEC_PATH"
-echo "  Launcher: $DESKTOP_DIR/$APP_NAME.desktop"
-echo "  Icon:     $ICON_DIR/mufidiwiwhi.svg"
+echo "  Run from the apps menu (Mufidiwiwhi) or: $APP"
 echo
-echo "If $INSTALL_BIN_DIR is on your PATH, just run: $APP_NAME"
-echo "Otherwise launch from your application menu (Mufidiwiwhi)."
+echo "  To uninstall, remove:"
+echo "    $BIN_DIR/$APP"
+echo "    $ICON_DIR/mufidiwiwhi.svg"
+echo "    $DESKTOP_DIR/$APP.desktop"
