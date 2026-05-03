@@ -6,6 +6,8 @@
 
 **v2.0.0 &mdash; now with a GUI.** See [DOCS.md](DOCS.md) for the user manual (what it does, how the corrector works, recommended settings, hardware, privacy).
 
+**Download the latest release:** [codeberg.org/adaures/mufidiwiwhi/releases](https://codeberg.org/adaures/mufidiwiwhi/releases)
+
 Mufidiwiwhi (Multi-file diarisation with Whisper) is a tiny, **quick-and-dirty** program built on top of [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
 It transcribes audio with reliable [speaker diarisation](https://en.wikipedia.org/wiki/Speaker_diarisation), by using **one file per speaker**: Mufidiwiwhi requires that you record each speaker in a separate file.
