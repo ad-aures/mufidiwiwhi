@@ -1,9 +1,15 @@
+<p align="center">
+  <img src="mufidiwiwhi.svg" alt="Mufidiwiwhi" width="128" height="128">
+</p>
+
 # Mufidiwiwhi
 
-Mufidiwiwhi (Multi-file diarisation with Whisper) is a tiny, **quick-and-dirty** program using [Whisper](https://github.com/openai/whisper).
+**v2.0.0 &mdash; now with a GUI.** See [DOCS.md](DOCS.md) for the user manual (what it does, how the corrector works, recommended settings, hardware, privacy).
 
-It will transcript audio files with reliable [speaker diarisation](https://en.wikipedia.org/wiki/Speaker_diarisation), by using **one file per speaker**: Mufidiwiwhi requires that you record each speaker in a separate file.  
-In order to do that, you can [use Mumble to record a podcast with guests](https://blog.castopod.org/use-mumble-to-record-a-podcast-with-guests/) or use [Ardour DAW](https://ardour.org/) to [record a Podcast with several remote guests](https://blog.castopod.org/how-to-record-a-podcast-with-several-remote-guests/) (you can also use [Zrythm](https://blog.castopod.org/how-to-record-a-podcast-with-zrythm/)).  
+Mufidiwiwhi (Multi-file diarisation with Whisper) is a tiny, **quick-and-dirty** program built on top of [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+
+It transcribes audio with reliable [speaker diarisation](https://en.wikipedia.org/wiki/Speaker_diarisation), by using **one file per speaker**: Mufidiwiwhi requires that you record each speaker in a separate file.
+You can [use Mumble to record a podcast with guests](https://blog.castopod.org/use-mumble-to-record-a-podcast-with-guests/) or use [Ardour DAW](https://ardour.org/) to [record a Podcast with several remote guests](https://blog.castopod.org/how-to-record-a-podcast-with-several-remote-guests/) (you can also use [Zrythm](https://blog.castopod.org/how-to-record-a-podcast-with-zrythm/)).
 This will create 100% accurate diarisation.
 
 Of course, you should run Mufidiwiwhi before merging all audio files together.
@@ -14,11 +20,29 @@ Make sure that you choose a [podcast hosting platform that supports transcripts]
 
 ## Setup
 
-You need [Whisper](https://github.com/openai/whisper) and [Pydub](http://pydub.com/) installed.
+Mufidiwiwhi requires Python 3.10 or newer. The transcription engine is `faster-whisper`, which uses CTranslate2 for inference (4 to 8 times faster than `openai-whisper` on CPU). `ffmpeg` must be available on the PATH.
 
-    pip install --upgrade --no-deps --force-reinstall git+https://github.com/openai/whisper.git
-    pip install pydub
-    pip install git+https://github.com/ad-aures/mufidiwiwhi.git
+    pip install git+https://codeberg.org/adaures/mufidiwiwhi.git
+
+This installs both the `mufidiwiwhi` CLI and the `mufidiwiwhi-gui` GUI. All runtime dependencies (faster-whisper, PyQt6, the phonetic libraries, httpx) are pulled in automatically.
+
+### Ubuntu installer (uses a PyInstaller binary)
+
+Build the standalone GUI binary first:
+
+    pyinstaller packaging/mufidiwiwhi-gui-onefile.spec --noconfirm
+
+Then install the binary, the icon, and an application-menu entry under `~/.local`:
+
+    ./install_ubuntu.sh
+
+The script never touches system packages and never asks for sudo. To install from a release URL instead of `./dist`:
+
+    ./install_ubuntu.sh --url https://example.com/mufidiwiwhi-gui-linux.tar.gz
+
+To uninstall:
+
+    ./install_ubuntu.sh --uninstall
 
 ## Command-line usage
 
@@ -28,13 +52,85 @@ To get help, type
 
 Example:
 
-    mufidiwiwhi Lucy interview_lucy.wav Samir interview_samir.wav Rachel interview_rachel.wav --model large --language French
+    mufidiwiwhi Lucy interview_lucy.wav Samir interview_samir.wav Rachel interview_rachel.wav --model large-v3 --language fr
 
-See [tokenizer.py](https://github.com/openai/whisper/blob/main/whisper/tokenizer.py) for the list of all available languages.
+You can also point Mufidiwiwhi at an Audacity `.aup3` project; each track is extracted to a 16 kHz mono WAV in a temp folder, the speaker name comes from the Audacity track name, and the temp folder is cleaned up when the app exits:
+
+    mufidiwiwhi project.aup3 --model medium --language fr
+
+Add `-v` / `--verbose` for per-chunk timing, replacement decisions, and any pathological-word warnings on stderr; the high-level pipeline progress prints on stdout by default.
+
+Overlapping speech (when one speaker interrupts another) is preserved as overlapping subtitle cues; SRT and VTT both support this. Most players render only one cue at a time, but the data is in the file.
+
+### Optional post-correction
+
+A plain-text dictionary of proper nouns and domain terms can be used to correct the transcript. The phonetic pass uses Whisper's per-word confidence: low-confidence words are replaced when phonetically close to a dictionary entry, mid-confidence words are replaced only when there is a single very close match, and high-confidence words are left alone.
+
+    # one entry per line, # for comments, multi-word entries allowed
+    cat > vocab.txt <<EOF
+    # Podcast vocabulary
+    Castopod
+    OpenRAG
+    Podcasting 2.0
+    Free Software Foundation
+    EOF
+
+    mufidiwiwhi Alice a.wav Bob b.wav --model small --language fr \
+        --dictionary vocab.txt \
+        --phonetic-lang fr --phonetic-lang-secondary en
+
+An optional second pass uses an [Ollama](https://ollama.com) model:
+
+    mufidiwiwhi Alice a.wav Bob b.wav --dictionary vocab.txt \
+        --llm-correct qwen2.5:7b
+
+If Ollama is unreachable, the LLM pass is skipped and the phonetic output is kept.
+
+## GUI
+
+A PyQt6 GUI is available via the `mufidiwiwhi-gui` console script. It exposes the same functionality as the CLI in a tabbed window (Setup, Project, Run). Settings persist via `QSettings`.
+
+    mufidiwiwhi-gui
+
+The GUI also accepts the same arguments as the CLI to prefill the project tab:
+
+    mufidiwiwhi-gui Lucy interview_lucy.wav Samir interview_samir.wav --dictionary vocab.txt
+
+A PyInstaller spec is provided in `packaging/` for single-file Linux distribution.
+
+## Dependencies
+
+Runtime:
+
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) &mdash; CTranslate2-backed Whisper inference.
+- [NumPy](https://numpy.org/) &mdash; numeric arrays for audio buffers.
+- [phonetic-fr](https://pypi.org/project/phonetic-fr/) &mdash; French phonetic algorithm.
+- [Metaphone](https://pypi.org/project/Metaphone/) &mdash; English phonetic algorithm.
+- [jellyfish](https://github.com/jamesturk/jellyfish) &mdash; Levenshtein and other string-distance metrics.
+- [spylls](https://github.com/zverok/spylls) &mdash; pure-Python Hunspell reader.
+- [psutil](https://github.com/giampaolo/psutil) &mdash; CPU / memory introspection for the GUI metrics strip.
+- [nvidia-ml-py](https://pypi.org/project/nvidia-ml-py/) &mdash; NVIDIA GPU / VRAM introspection.
+- [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) &mdash; the GUI toolkit.
+- [pydub](https://github.com/jiaaro/pydub) &mdash; audio chunking via `ffmpeg`.
+
+Build / dev:
+
+- [pytest](https://pytest.org/) &mdash; test runner.
+- [PyInstaller](https://pyinstaller.org/) &mdash; standalone Linux binary builds.
+
+External tools:
+
+- [ffmpeg](https://ffmpeg.org/) &mdash; audio decoding (must be on `PATH`).
+- [Ollama](https://ollama.com/) &mdash; optional LLM second-pass corrector.
+
+## Credits
+
+Sidebar and toolbar icons are from the [Solar Linear Icons Collection](https://www.svgrepo.com/collection/solar-linear-icons/) on SVG Repo.
+
+## Author
+
+Benjamin Bellamy &lt;benjamin@podlibre.org&gt;.
 
 ## License
 
-Whisper's code and model weights are released under the MIT License. See [LICENSE](https://github.com/openai/whisper/blob/main/LICENSE) for further details.
-
-Mufidiwiwhi's code is released under the MIT License. See [LICENSE](https://github.com/adaures/mufidiwiwhi/blob/main/LICENSE) for further details.
-
+Mufidiwiwhi is released under the **GNU General Public License v3**. Copyright &copy; 2026 Ad Aures. See [LICENSE](https://codeberg.org/adaures/mufidiwiwhi/src/branch/main/LICENSE) for further details.

@@ -1,440 +1,832 @@
-#!env/bin/python3
+# Mufidiwiwhi - multi-file diarisation transcription with Whisper.
+# (C) 2026 Ad Aures · Benjamin Bellamy <benjamin@podlibre.org>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 3 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import os
+"""Per-speaker transcription, explicit chunking, and merge.
+
+Audio is split into chunks BEFORE faster-whisper sees it. The
+chunker is a re-implementation of the original handwritten one
+(commit `e64e524`) that the migration to faster-whisper had
+silently dropped. Faster-whisper's own VAD is bypassed because
+it was found to drop audio that carried real words at chunk
+boundaries (the s02e32_b 160 ms gap incident).
+
+Chunker invariants:
+  * each chunk is at most 30 s long;
+  * each chunk ends at the local-minimum-RMS point inside its
+    look-ahead window (i.e. the quietest 50 ms slice in
+    `[start + 2 s, start + 30 s]`);
+  * chunks DON'T start with leading silence (the cursor advances
+    past it before recording the chunk's start);
+  * NO non-silent audio is ever skipped between chunks: the next
+    chunk starts exactly where the previous one ended;
+  * the silence threshold is adaptive: `audio.max_dBFS - 35 dB`.
+
+Segments are streamed out as faster-whisper produces them, then
+their timestamps are offset by the chunk's start position before
+the rest of the pipeline sees them.
+
+Cross-chunk overlap resolution lives in `resolve_segment_overlaps`
+and runs once globally, after `merge_segments` collects every
+speaker's stream.
+"""
+
+from __future__ import annotations
+
+import html
 import sys
-import argparse
-import whisper
-import pydub
-import numpy as np
-import torch
-import tqdm
-import warnings
-from pydub import AudioSegment
-from pydub.silence import db_to_float
-from typing import Optional, Union, Tuple
-from whisper.audio import (
-    CHUNK_LENGTH,
-    FRAMES_PER_SECOND,
-    HOP_LENGTH,
-    N_FRAMES,
-    N_SAMPLES,
-    SAMPLE_RATE,
-    log_mel_spectrogram,
-    pad_or_trim,
-)
-from whisper.tokenizer import (
-    LANGUAGES,
-    TO_LANGUAGE_CODE,
-    get_tokenizer,
-)
-from whisper.decoding import DecodingOptions, DecodingResult
-from whisper.utils import (
-    exact_div,
-    format_timestamp,
-    make_safe,
-    optional_float,
-    optional_int,
-    str2bool,
-)
-from utils import (
-    get_writer,
-)
-from whisper import available_models
+import time
+import unicodedata
+from typing import Any, Callable, Iterator, Optional
 
-MIN_SILENCE_LEN = 500             # silence longer than MIN_SILENCE_LEN ms will be trimed
-SEEK_STEP = 50                    # search for silence every SEEK_STEP ms
-DBFS_THRESHOLD = 40               # cuts every time dbFS falls DBFS_THRESHOLD db under
-MIN_CHUNK_LEN = 700               # each chunk must be longer than MIN_CHUNK_LEN ms
-MAX_CHUNK_LEN = CHUNK_LENGTH*1000 # each chunk must be shorter than MAX_CHUNK_LEN ms
+from .core import Cancelled, LogCb, CancelCb, RunConfig, vstderr
 
-# Convert Pydub audio to numpy array:
-def pydub_to_np(pydub_audio: pydub.AudioSegment) -> (np.ndarray):
-    # Converts pydub audio segment into np.float32 of shape [duration_in_seconds*sample_rate, channels],
-    # where each value is in range [-1.0, 1.0].
-    return np.array(pydub_audio.get_array_of_samples(), np.int16).flatten().astype(np.float32) / pydub_audio.max
+ProgressCb = Callable[[float], None]
 
-# Let's transcribe some audio!
-def transcribe(
-    model: "Whisper",
-    audio_dicts: list,
-    *,
-    verbose: Optional[bool] = None,
-    temperature: Union[float, Tuple[float, ...]] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-    compression_ratio_threshold: Optional[float] = 2.4,
-    logprob_threshold: Optional[float] = -0.57,
-    no_speech_threshold: Optional[float] = 0.6,
-    condition_on_previous_text: bool = True,
-    initial_prompt: Optional[str] = None,
-    word_timestamps: bool = False,
-    prepend_punctuations: str = "\"'“¿([{-",
-    append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
-    **decode_options,
-):
+
+_DEFAULT_CONF_THRESHOLDS = (0.99, 0.80, 0.70, 0.60)
+
+
+# ---------------------------------------------------------------------------
+# Whisper-hallucination filter
+# ---------------------------------------------------------------------------
+
+
+# Whisper has a known habit of falling back to a small set of stock
+# captions when fed silence or noise. The strings below are
+# normalised (lowercased, accents stripped, punctuation collapsed)
+# substrings that, when contained in a segment's text, mark the
+# segment as a hallucination. Add to this list as you spot new
+# offenders; per-language is OK but the matcher is language-agnostic.
+_HALLUCINATION_NEEDLES: tuple[str, ...] = (
+    # French - Amara.org subtitle credits (the canonical case).
+    # We only match the distinctive trailing fragment so misspellings
+    # of the leading wording (e.g. "para" instead of "par") still get
+    # caught.
+    "communaute d'amara",
+    "merci d'avoir regarde",
+    "abonnez-vous a la chaine",
+    "abonnez vous a la chaine",
+    "soustitreur.com",
+    "sous-titreur.com",
+    # English - same family of stock fillers.
+    "amara.org community",
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "please like and subscribe",
+)
+
+
+def _hallucination_normalise(text: str) -> str:
+    """Lowercase + strip combining marks so hallucination patterns
+    match whatever case / accents Whisper chose for the offending
+    segment."""
+    nfkd = unicodedata.normalize("NFKD", text or "")
+    no_marks = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return no_marks.lower()
+
+
+def _is_hallucination(text: str) -> bool:
+    """True when `text` looks like one of Whisper's known stock
+    fallbacks. Substring match on the normalised form."""
+    if not text:
+        return False
+    norm = _hallucination_normalise(text)
+    if not norm.strip():
+        return False
+    return any(needle in norm for needle in _HALLUCINATION_NEEDLES)
+
+
+# ---------------------------------------------------------------------------
+# Chunker
+# ---------------------------------------------------------------------------
+
+
+# Chunker constants. Tweaked from the original (e64e524) values to keep
+# parity with the user's expectations.
+_MAX_CHUNK_MS = 30_000
+_MIN_CHUNK_MS = 2_000
+_SEEK_STEP_MS = 50
+_SILENCE_DROP_DB = 35
+
+
+def _silence_rms_threshold(audio) -> float:
+    """RMS threshold in raw amplitude units corresponding to
+    `audio.max_dBFS - SILENCE_DROP_DB`. Anything below this is
+    treated as silence by the chunker.
     """
-    Transcribe an audio file using Whisper
-    Parameters
-    ----------
-    model: Whisper
-        The Whisper model instance
-    audio: Union[str, np.ndarray, torch.Tensor]
-        The path to the audio file to open, or the audio waveform
-    verbose: bool
-        Whether to display the text being decoded to the console. If True, displays all the details,
-        If False, displays minimal details. If None, does not display anything
-    temperature: Union[float, Tuple[float, ...]]
-        Temperature for sampling. It can be a tuple of temperatures, which will be successively used
-        upon failures according to either `compression_ratio_threshold` or `logprob_threshold`.
-    compression_ratio_threshold: float
-        If the gzip compression ratio is above this value, treat as failed
-    logprob_threshold: float
-        If the average log probability over sampled tokens is below this value, treat as failed
-    no_speech_threshold: float
-        If the no_speech probability is higher than this value AND the average log probability
-        over sampled tokens is below `logprob_threshold`, consider the segment as silent
-    condition_on_previous_text: bool
-        if True, the previous output of the model is provided as a prompt for the next window;
-        disabling may make the text inconsistent across windows, but the model becomes less prone to
-        getting stuck in a failure loop, such as repetition looping or timestamps going out of sync.
-    word_timestamps: bool
-        Extract word-level timestamps using the cross-attention pattern and dynamic time warping,
-        and include the timestamps for each word in each segment.
-    prepend_punctuations: str
-        If word_timestamps is True, merge these punctuation symbols with the next word
-    append_punctuations: str
-        If word_timestamps is True, merge these punctuation symbols with the previous word
-    initial_prompt: Optional[str]
-        Optional text to provide as a prompt for the first window. This can be used to provide, or
-        "prompt-engineer" a context for transcription, e.g. custom vocabularies or proper nouns
-        to make it more likely to predict those word correctly.
-    decode_options: dict
-        Keyword arguments to construct `DecodingOptions` instances
-    Returns
-    -------
-    A dictionary containing the resulting text ("text") and segment-level details ("segments"), and
-    the spoken language ("language"), which is detected when `decode_options["language"]` is None.
+    from pydub.utils import db_to_float  # type: ignore
+
+    threshold_dbfs = audio.max_dBFS - _SILENCE_DROP_DB
+    return float(db_to_float(threshold_dbfs)) * float(audio.max_possible_amplitude)
+
+
+def _iter_chunks(audio_path: str) -> Iterator[tuple[int, int, Any]]:
+    """Public wrapper: load the file with pydub, then delegate to
+    `_iter_chunks_from`. Useful when the caller only has a path.
     """
-    dtype = torch.float16 if decode_options.get("fp16", True) else torch.float32
-    if model.device == torch.device("cpu"):
-        if torch.cuda.is_available():
-            warnings.warn("Performing inference on CPU when CUDA is available")
-        if dtype == torch.float16:
-            warnings.warn("FP16 is not supported on CPU; using FP32 instead")
-            dtype = torch.float32
+    from pydub import AudioSegment  # type: ignore
 
-    if dtype == torch.float32:
-        decode_options["fp16"] = False
+    audio = AudioSegment.from_file(audio_path)
+    yield from _iter_chunks_from(audio)
 
-    language: str
 
-    all_tokens = []
-    all_segments = []
-    prompt_reset_since = 0
+def _audiosegment_to_float32(audio) -> "Any":
+    """Convert a pydub `AudioSegment` to a mono float32 numpy
+    array in [-1, 1], the format `WhisperModel.transcribe` expects
+    when handed in-memory audio.
+    """
+    import numpy as np  # type: ignore
 
-    for audio_dict in audio_dicts:
-        speaker=audio_dict['speaker']
-        if verbose is not None:
-           print(
-               f"Speaker: {speaker}"
-           )
-        
-        pydub_audio = AudioSegment.from_file(audio_dict['file_path'])
-        # resample audio to 16KHz, monophonic, 16bits/sample, remove offset
-        pydub_audio = pydub_audio.set_frame_rate(SAMPLE_RATE)
-        pydub_audio = pydub_audio.set_channels(1)
-        pydub_audio = pydub_audio.set_sample_width(2)
-        pydub_audio = pydub_audio.remove_dc_offset()
+    audio = audio.set_frame_rate(16_000).set_channels(1)
+    samples = np.frombuffer(audio.raw_data, dtype=np.int16).astype(np.float32)
+    samples /= 32768.0
+    return samples
 
-        # Pad 30-seconds of silence to the input audio, for slicing
-        mel = log_mel_spectrogram(pydub_to_np(pydub_audio))
-        content_frames = mel.shape[-1] - N_FRAMES
 
-        if decode_options.get("language", None) is None:
-            if not model.is_multilingual:
-                decode_options["language"] = "en"
-            else:
-                if verbose:
-                    print(
-                        "Detecting language using up to the first 30 seconds from the first file. You should probably use `--language` to specify the language"
-                    )
-                mel_segment = pad_or_trim(mel, N_FRAMES).to(model.device).to(dtype)
-                _, probs = model.detect_language(mel_segment)
-                decode_options["language"] = max(probs, key=probs.get)
-                if verbose is not None:
-                    print(
-                        f"Detected language: {LANGUAGES[decode_options['language']].title()}"
-                    )
+# ---------------------------------------------------------------------------
+# Word-confidence colouring (unchanged)
+# ---------------------------------------------------------------------------
 
-        language = decode_options["language"]
-        task: str = decode_options.get("task", "transcribe")
-        tokenizer = get_tokenizer(model.is_multilingual, language=language, task=task)
 
-        if word_timestamps and task == "translate":
-            warnings.warn("Word-level timestamps on translations may not be reliable.")
+def _confidence_bg(
+    probability: float,
+    thresholds: Optional[tuple[float, float, float, float]] = None,
+) -> Optional[str]:
+    """Background colour for a word given its Whisper confidence.
 
-        def decode_with_fallback(segment: torch.Tensor) -> DecodingResult:
-            temperatures = (
-                [temperature] if isinstance(temperature, (int, float)) else temperature
-            )
-            decode_result = None
+    `thresholds` is a 4-tuple `(excellent, high, mid, low)`. When the
+    probability is at or above `excellent`, the word gets the green
+    tint; between `high` and `excellent`, no background; between
+    `mid` and `high`, pale yellow; between `low` and `mid`, light
+    orange; below `low`, pink.
 
-            for t in temperatures:
-                kwargs = {**decode_options}
-                if t > 0:
-                    # disable beam_size and patience when t > 0
-                    kwargs.pop("beam_size", None)
-                    kwargs.pop("patience", None)
-                else:
-                    # disable best_of when t == 0
-                    kwargs.pop("best_of", None)
+    Defaults: (0.99, 0.80, 0.70, 0.60).
+    """
+    excellent, high, mid, low = thresholds or _DEFAULT_CONF_THRESHOLDS
+    if probability >= excellent:
+        return "#e5ffd5"
+    if probability >= high:
+        return None
+    if probability >= mid:
+        return "#fff6d5"
+    if probability >= low:
+        return "#ffe6d5"
+    return "#ffd5d5"
 
-                options = DecodingOptions(**kwargs, temperature=t)
-                decode_result = model.decode(segment, options)
 
-                needs_fallback = False
-                if (
-                    compression_ratio_threshold is not None
-                    and decode_result.compression_ratio > compression_ratio_threshold
-                ):
-                    needs_fallback = True  # too repetitive
-                if (
-                    logprob_threshold is not None
-                    and decode_result.avg_logprob < logprob_threshold
-                ):
-                    needs_fallback = True  # average log probability is too low
+def _format_ts(seconds: float) -> str:
+    """Compact MM:SS.mmm timestamp for log lines."""
+    if seconds < 0:
+        seconds = 0.0
+    total_ms = int(round(seconds * 1000))
+    hours = total_ms // 3_600_000
+    total_ms -= hours * 3_600_000
+    minutes = total_ms // 60_000
+    total_ms -= minutes * 60_000
+    secs = total_ms // 1_000
+    ms = total_ms - secs * 1_000
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+    return f"{minutes:02d}:{secs:02d}.{ms:03d}"
 
-                if not needs_fallback:
-                    break
 
-            return decode_result
-
-        # Total length of the audio file:
-        total_len = len(pydub_audio)
-        # Cursor within audio file:
-        file_cursor = 0
-        # Silence Threshold, everything lower this will be trimed:
-        silence_threshold = db_to_float(pydub_audio.max_dBFS-DBFS_THRESHOLD) * pydub_audio.max_possible_amplitude
-
-        if initial_prompt is not None:
-            initial_prompt_tokens = tokenizer.encode(" " + initial_prompt.strip())
-            all_tokens.extend(initial_prompt_tokens)
-        else:
-            initial_prompt_tokens = []
-
-        def new_segment(
-                *, start: float, end: float, speaker:str, tokens: torch.Tensor, result: DecodingResult
-        ):
-            text_tokens = [token for token in tokens.tolist() if token < tokenizer.eot]
-            return {
-                "id": len(all_segments),
-                "seek": file_cursor/1000,
-                "start": start,
-                "end": end,
-                "speaker": speaker,
-                "text": tokenizer.decode(text_tokens),
-                "tokens": text_tokens,
-                "temperature": result.temperature,
-                "avg_logprob": result.avg_logprob,
-                "compression_ratio": result.compression_ratio,
-                "no_speech_prob": result.no_speech_prob,
+def _build_segment_dict(
+    s,
+    speaker: str,
+    cfg: RunConfig,
+    seg_id: int,
+    time_offset_s: float,
+    language: Optional[str],
+) -> dict:
+    """Materialise a faster-whisper segment object into the dict
+    shape the rest of the pipeline expects, applying `time_offset_s`
+    to every timestamp (segment-level and word-level)."""
+    words_payload: Optional[list[dict]] = None
+    if cfg.word_timestamps:
+        raw_words = getattr(s, "words", None) or []
+        words_payload = [
+            {
+                "word": w.word,
+                "start": float(w.start) + time_offset_s,
+                "end": float(w.end) + time_offset_s,
+                "probability": float(w.probability),
             }
+            for w in raw_words
+        ]
+    text = s.text
+    return {
+        "id": seg_id,
+        "seek": float(s.start) + time_offset_s,
+        "start": float(s.start) + time_offset_s,
+        "end": float(s.end) + time_offset_s,
+        "speaker": speaker,
+        "text": text,
+        "tokens": list(s.tokens) if getattr(s, "tokens", None) else [],
+        "temperature": float(getattr(s, "temperature", 0.0) or 0.0),
+        "avg_logprob": float(getattr(s, "avg_logprob", 0.0) or 0.0),
+        "compression_ratio": float(
+            getattr(s, "compression_ratio", 0.0) or 0.0
+        ),
+        "no_speech_prob": float(getattr(s, "no_speech_prob", 0.0) or 0.0),
+        "words": words_payload,
+        "language": language,
+        # Tagged here, filtered out of the writer pipeline in
+        # `core.run_pipeline`. The live log still renders the
+        # segment so the user sees what got dropped.
+        "hallucination": _is_hallucination(text),
+    }
 
-        # show the progress bar when verbose is False (if True, transcribed text will be printed)
-        with tqdm.tqdm(
-            total=total_len//1000, unit=" seconds", disable=verbose is not False
-        ) as pbar:
-            while file_cursor < (total_len - MIN_CHUNK_LEN):
-                previous_cursor = file_cursor
-                # Find the first non-silence piece:
-                while file_cursor<(total_len - MIN_CHUNK_LEN) and (pydub_audio[file_cursor : file_cursor + SEEK_STEP].rms < silence_threshold):
-                    file_cursor += SEEK_STEP
-                chunk_cursor = file_cursor + MIN_CHUNK_LEN
-                chunk_min_cursor = chunk_cursor            
-                min_rms = pydub_audio[chunk_cursor : chunk_cursor + MIN_SILENCE_LEN].rms
-                # Finding the lowest cursor:
-                while chunk_cursor < (total_len - MIN_SILENCE_LEN) and chunk_cursor < (file_cursor + MAX_CHUNK_LEN):
-                    chunk_rms = pydub_audio[chunk_cursor : chunk_cursor + MIN_SILENCE_LEN].rms
-                    # If the current level is lower than the threshold, cut here, no need to go further:
-                    if chunk_rms <= silence_threshold:
-                        chunk_tmp_min_cursor = chunk_cursor
-                        min_rms = chunk_rms
-                        # We look for the best timestamp to cut in the next MIN_SILENCE_LEN interval:
-                        while chunk_cursor < (total_len - MIN_SILENCE_LEN) and chunk_cursor < (chunk_tmp_min_cursor + MIN_SILENCE_LEN):
-                            chunk_rms = pydub_audio[chunk_cursor : chunk_cursor + MIN_SILENCE_LEN].rms
-                            if chunk_rms <= min_rms:
-                                chunk_min_cursor = chunk_cursor
-                                min_rms = chunk_rms
-                            chunk_cursor += SEEK_STEP                        
-                        chunk_cursor = file_cursor + MAX_CHUNK_LEN
-                    # Else find the minimum:
-                    else:
-                        if chunk_rms <= min_rms:
-                            chunk_min_cursor = chunk_cursor
-                            min_rms = chunk_rms
-                        chunk_cursor += SEEK_STEP
 
-                audio_chunk = pydub_audio[file_cursor : chunk_min_cursor + MIN_SILENCE_LEN]
-
-                mel_segment = pad_or_trim(log_mel_spectrogram(pydub_to_np(audio_chunk)), N_FRAMES).to(model.device).to(dtype)
-                current_segments = []
-
-                decode_options["prompt"] = all_tokens[prompt_reset_since:]
-                result: DecodingResult = decode_with_fallback(mel_segment)
-                tokens = torch.tensor(result.tokens)
-
-                if(result.avg_logprob > logprob_threshold) and (result.no_speech_prob < no_speech_threshold):
-                    current_segments.append(
-                        new_segment(
-                            start=file_cursor/1000,
-                            end=chunk_min_cursor/1000,
-                            speaker=speaker,
-                            tokens=tokens,
-                            result=result,
-                        )
+def _emit_segment_log(
+    seg_dict: dict,
+    speaker: str,
+    cfg: RunConfig,
+    log: Optional[LogCb],
+    log_html: Optional[LogCb],
+) -> None:
+    """Stream a per-segment line to the log_html receiver (with
+    confidence-colouring + correction diffs) and / or the plain
+    log receiver."""
+    words_payload = seg_dict.get("words")
+    is_hallucination = bool(seg_dict.get("hallucination"))
+    emitted_rich = False
+    if log_html is not None and (words_payload or is_hallucination):
+        thresholds = getattr(cfg, "conf_thresholds", None)
+        ts_text = (
+            f"{_format_ts(seg_dict['start'])} -&gt; "
+            f"{_format_ts(seg_dict['end'])}"
+        )
+        prefix = (
+            "<span style='background-color:#4d4d4d;color:#ffffff;'>"
+            f"&nbsp;{ts_text}&nbsp;</span>"
+            "<span style='background-color:transparent;color:inherit;'>"
+            "&nbsp;</span>"
+            "<span style='background-color:#2ea44f;color:#ffffff;'>"
+            f"&nbsp;{html.escape(speaker)}&nbsp;</span>"
+            "<span style='background-color:transparent;color:inherit;'>"
+            "&nbsp;</span>"
+        )
+        parts = [
+            "<pre style='margin:0;font-family:inherit;"
+            "background-color:transparent;'>",
+            prefix,
+        ]
+        if is_hallucination:
+            # Whole segment is a known Whisper hallucination - render
+            # it with strikethrough on a neutral grey so the user
+            # sees what got dropped, then skip the per-word loop.
+            text = html.escape(seg_dict.get("text", "").strip())
+            parts.append(
+                "<span style='text-decoration:line-through;"
+                "background-color:#e6e6e6;color:#5e5e5e;'>"
+                f"{text}</span>"
+            )
+            parts.append(
+                "<span style='background-color:transparent;color:inherit;'>"
+                "​&nbsp;</span>"
+            )
+            parts.append("</pre>")
+            log_html("".join(parts))
+            return
+        for w in words_payload:
+            correction = w.get("correction")
+            if correction:
+                orig = html.escape(correction.get("original", ""))
+                repl = html.escape(correction.get("replacement", ""))
+                orig_conf = float(
+                    correction.get("original_confidence", 1.0)
+                )
+                orig_bg = _confidence_bg(orig_conf, thresholds)
+                raw = w.get("word", "")
+                leading_ws = ""
+                k = 0
+                while k < len(raw) and raw[k].isspace():
+                    leading_ws += raw[k]
+                    k += 1
+                parts.append(html.escape(leading_ws))
+                if orig:
+                    bg_style = (
+                        f"background-color:{orig_bg};"
+                        if orig_bg
+                        else ""
                     )
-                    #current_tokens.append(tokens.tolist())
-                file_cursor = chunk_min_cursor
-
-                if not condition_on_previous_text or result.temperature > 0.5:
-                    # do not feed the prompt tokens if a high temperature was used
-                    prompt_reset_since = len(all_tokens)
-
-                if word_timestamps:
-                    add_word_timestamps(
-                        segments=current_segments,
-                        model=model,
-                        tokenizer=tokenizer,
-                        mel=mel_segment,
-                        num_frames=segment_size,
-                        prepend_punctuations=prepend_punctuations,
-                        append_punctuations=append_punctuations,
+                    parts.append(
+                        "<span style='text-decoration:line-through;"
+                        f"{bg_style}'>{orig}</span> "
                     )
-                    word_end_timestamps = [
-                        w["end"] for s in current_segments for w in s["words"]
-                    ]
-                    if not single_timestamp_ending and len(word_end_timestamps) > 0:
-                        seek_shift = round(
-                            (word_end_timestamps[-1] - time_offset) * FRAMES_PER_SECOND
-                        )
-                        if seek_shift > 0:
-                            seek = previous_seek + seek_shift
-
-                if verbose:
-                    for segment in current_segments:
-                        start, end, text = segment["start"], segment["end"], segment["text"]
-                        line = f"[{format_timestamp(start)} --> {format_timestamp(end)}] {text}"
-                        print(make_safe(line))
-
-                # if a segment is instantaneous or does not contain text, clear it
-                for i, segment in enumerate(current_segments):
-                    if segment["start"] == segment["end"] or segment["text"].strip() == "":
-                        segment["text"] = ""
-                        segment["tokens"] = []
-                        segment["words"] = []
-                        current_tokens[i] = []  
-
-                all_segments.extend(current_segments)
-
-                # update progress bar
-                pbar.update((file_cursor-previous_cursor)//1000)
-
-    # sort all transcriptions for all speakers:
-    all_segments = sorted(all_segments, key=lambda d: d['start'])
-
-    # We look for overlaps (speakers interrupting each other…):
-    i = 0
-    # we go from the first segment to the penultimate:
-    while i < len(all_segments)-1:
-        # we set the segment ID to the current cursor value (because we sorted all speakers together):
-        all_segments[i]['id']=i
-        # Is there a segment after that starts before the current one ends:
-        while(i < len(all_segments)-1) and (all_segments[i]['end']>all_segments[i+1]['start']):
-            # if the next segment ends before the current one, we just ignore it and delete it:          
-            if(all_segments[i]['end']>=all_segments[i+1]['end']):
-                del all_segments[i+1]
-            # otherwise we split in the middle and we make the current one end when the next one starts
+                parts.append(
+                    "<span style='background-color:#c2ebff;'>"
+                    f"{repl}</span>"
+                )
+            elif w.get("uncorrectable_misspelled"):
+                # Hunspell flagged the word as misspelled at low
+                # confidence and we had no usable suggestion: paint
+                # it grey so the user spots "definitely wrong, but
+                # we don't know what's right" at a glance.
+                token = html.escape(w["word"])
+                parts.append(
+                    f"<span style='background-color:#e6e6e6;'>"
+                    f"{token}</span>"
+                )
             else:
-                avg=(all_segments[i]['end']+all_segments[i+1]['start'])/2
-                all_segments[i]['end']=avg
-                all_segments[i+1]['start']=avg
-        i += 1
+                bg = _confidence_bg(w["probability"], thresholds)
+                token = html.escape(w["word"])
+                if bg is None:
+                    parts.append(token)
+                else:
+                    parts.append(
+                        f"<span style='background-color:{bg};'>"
+                        f"{token}</span>"
+                    )
+        parts.append(
+            "<span style='background-color:transparent;color:inherit;'>"
+            "​&nbsp;</span>"
+        )
+        parts.append("</pre>")
+        log_html("".join(parts))
+        emitted_rich = True
+    if log is not None and not emitted_rich:
+        log(
+            f"[{_format_ts(seg_dict['start'])} -> "
+            f"{_format_ts(seg_dict['end'])}] "
+            f"[{speaker}] {seg_dict['text'].strip()}"
+        )
 
-    return dict(
-        text=tokenizer.decode(all_tokens[len(initial_prompt_tokens) :]),
-        segments=all_segments,
-        language=language,
+
+# ---------------------------------------------------------------------------
+# Per-speaker transcription
+# ---------------------------------------------------------------------------
+
+
+def transcribe_speaker(
+    model: Any,
+    audio_path: str,
+    speaker: str,
+    cfg: RunConfig,
+    *,
+    log: Optional[LogCb] = None,
+    log_html: Optional[LogCb] = None,
+    cancel: Optional[CancelCb] = None,
+    progress: Optional[ProgressCb] = None,
+    correction_state: Any = None,
+) -> list[dict]:
+    """Transcribe one speaker file with faster-whisper.
+
+    The audio is chunked locally with `_iter_chunks` (see top of
+    module). Each chunk is decoded independently with
+    `vad_filter=False`; segment timestamps are offset back into
+    the full file's time base before emission. Returns the list of
+    segment dicts in chunk-then-decode order.
+    """
+    from pydub import AudioSegment  # type: ignore
+
+    if log is not None:
+        log(f"Opening {audio_path!r} for speaker '{speaker}'")
+
+    vstderr(f"[{speaker}] AudioSegment.from_file({audio_path!r}) starting...")
+    t_load = time.monotonic()
+    full_audio = AudioSegment.from_file(audio_path)
+    vstderr(
+        f"[{speaker}] AudioSegment.from_file done in "
+        f"{time.monotonic() - t_load:.2f}s"
+    )
+    total_ms = len(full_audio)
+    duration_s = total_ms / 1000.0
+    detected_language: Optional[str] = cfg.language
+
+    if log is not None:
+        log(
+            f"Audio duration {duration_s:.1f}s. "
+            f"Chunking with explicit RMS-minima cuts (no VAD)."
+        )
+
+    out: list[dict] = []
+    chunk_index = 0
+    for chunk_start_ms, chunk_end_ms, chunk_audio in _iter_chunks_from(
+        full_audio, log=log
+    ):
+        if cancel and cancel():
+            raise Cancelled()
+        chunk_index += 1
+        offset_s = chunk_start_ms / 1000.0
+        chunk_dur_s = (chunk_end_ms - chunk_start_ms) / 1000.0
+        vstderr(
+            f"[{speaker}] chunk {chunk_index}: "
+            f"{_format_ts(chunk_start_ms / 1000.0)} -> "
+            f"{_format_ts(chunk_end_ms / 1000.0)} "
+            f"({chunk_dur_s:.1f}s) decoding..."
+        )
+        t_chunk = time.monotonic()
+        samples = _audiosegment_to_float32(chunk_audio)
+        t_whisper_start = time.monotonic()
+        segments_iter, info = model.transcribe(
+            samples,
+            language=cfg.language,
+            task=cfg.task,
+            initial_prompt=cfg.initial_prompt,
+            temperature=cfg.temperature,
+            # Disable Whisper's segment-drop filters. The chunker
+            # has already decided this chunk contains speech (via
+            # the RMS test), so we trust that and force Whisper to
+            # emit a transcription for every sample. Whisper's own
+            # `log_prob_threshold` / `no_speech_threshold` are
+            # opinionated quality gates that drop any segment the
+            # decoder isn't sure about, including real but quiet
+            # speech. Compression-ratio filtering stays on because
+            # it catches genuine hallucination loops (e.g. the
+            # "thanks for watching" repeats), not silence.
+            log_prob_threshold=None,
+            no_speech_threshold=1.0,
+            compression_ratio_threshold=cfg.compression_ratio_threshold,
+            condition_on_previous_text=cfg.condition_on_previous_text,
+            word_timestamps=cfg.word_timestamps,
+            vad_filter=False,
+        )
+        if detected_language is None:
+            detected_language = getattr(info, "language", None)
+        chunk_seg_count = 0
+        for s in segments_iter:
+            if cancel and cancel():
+                raise Cancelled()
+            chunk_seg_count += 1
+            seg_dict = _build_segment_dict(
+                s, speaker, cfg, len(out), offset_s, detected_language
+            )
+            if correction_state is not None:
+                try:
+                    from . import correct as _c
+
+                    t_corr = time.monotonic()
+                    _c.correct_segment_in_place(seg_dict, correction_state)
+                    corr_dt = time.monotonic() - t_corr
+                    if corr_dt > 1.0:
+                        vstderr(
+                            f"[{speaker}] chunk {chunk_index} seg "
+                            f"{seg_dict['id']}: correction took "
+                            f"{corr_dt:.2f}s"
+                        )
+                except Exception as exc:
+                    if log is not None:
+                        log(
+                            f"Per-chunk correction failed on segment "
+                            f"{seg_dict['id']}: {exc}"
+                        )
+            out.append(seg_dict)
+            _emit_segment_log(seg_dict, speaker, cfg, log, log_html)
+        chunk_dt = time.monotonic() - t_chunk
+        whisper_dt = time.monotonic() - t_whisper_start
+        vstderr(
+            f"[{speaker}] chunk {chunk_index}: done in {chunk_dt:.2f}s "
+            f"({chunk_seg_count} segments, whisper {whisper_dt:.2f}s)"
+        )
+        if progress is not None and total_ms > 0:
+            progress(min(1.0, chunk_end_ms / total_ms))
+
+    if log is not None:
+        log(f"Finished '{speaker}': {len(out)} segments")
+    return out
+
+
+def _iter_chunks_from(
+    audio, log: Optional[LogCb] = None
+) -> Iterator[tuple[int, int, Any]]:
+    """Numpy-vectorised chunker. Decodes the AudioSegment to a
+    mono int16 numpy array once, computes per-50ms RMS in a
+    single vectorised pass, then walks the RMS array to find
+    chunk boundaries.
+
+    The previous pure-pydub implementation called
+    `audio[lo:hi].rms` per 50 ms slice; pydub creates a new
+    AudioSegment object and iterates samples in pure Python for
+    each call, which made the chunker the dominant stall on
+    long files (multi-hour audio took minutes just to probe).
+    Now the entire chunking decision is O(N) numpy and runs in
+    well under a second for hours of audio.
+
+    Silence handling: cursor advances by `_MIN_CHUNK_MS` at a
+    time. If EVERY 50 ms slice in the lookahead window is below
+    the silence threshold, the cursor advances past the window
+    without yielding a chunk. As soon as ANY slice in the
+    window has speech-level RMS, the cursor stops and the chunk
+    starts THERE, including the leading silence inside that
+    window - so a faint speech tail just past a chunk boundary
+    survives into the next chunk's transcription window.
+
+    Boundaries: chunk_end is the local-RMS minimum in
+    `[start + MIN, start + MAX]`. Each chunk starts exactly
+    where the previous one ended; audio inside a "has-speech"
+    region is never skipped.
+    """
+    import numpy as np  # type: ignore
+
+    total_ms = len(audio)
+    if total_ms <= 0:
+        return
+    rate = audio.frame_rate
+    step = max(1, rate * _SEEK_STEP_MS // 1000)  # samples per 50 ms slice
+    vstderr(
+        f"chunker: decoding {total_ms / 1000.0:.1f}s audio "
+        f"({rate} Hz, {audio.channels}ch) for RMS scan..."
+    )
+    t0 = time.monotonic()
+    if audio.channels > 1:
+        mono = audio.set_channels(1)
+    else:
+        mono = audio
+    samples = np.frombuffer(mono.raw_data, dtype=np.int16).astype(np.float32)
+    n = samples.shape[0]
+    if n < step:
+        # Audio shorter than one slice: yield the whole thing.
+        yield 0, total_ms, audio
+        return
+    n_slices = n // step
+    sliced = samples[: n_slices * step].reshape(n_slices, step)
+    # Per-slice RMS via vectorised mean of squares.
+    rms = np.sqrt(np.mean(sliced * sliced, axis=1))
+    peak = float(np.max(np.abs(samples)))
+    if peak <= 0.0:
+        vstderr("chunker: audio is fully silent, no chunks yielded")
+        return
+    silence_rms = peak * (10.0 ** (-_SILENCE_DROP_DB / 20.0))
+    vstderr(
+        f"chunker: {n_slices} slices, peak={peak:.0f}, "
+        f"silence threshold={silence_rms:.1f} "
+        f"(scan in {time.monotonic() - t0:.2f}s)"
     )
 
-def cli():
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("audio_args", nargs="+", type=str, help="speaker names and audio files to transcribe")
-    parser.add_argument("--model", default="small", choices=available_models(), help="name of the Whisper model to use")
-    parser.add_argument("--model_dir", type=str, default=None, help="the path to save model files; uses ~/.cache/whisper by default")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="device to use for PyTorch inference")
-    parser.add_argument("--output_dir", "-o", type=str, default=".", help="directory to save the outputs")
-    parser.add_argument("--output_format", "-f", type=str, default="all", choices=["txt", "srt", "json", "all"], help="format of the output file; if not specified, all available formats will be produced")
-    parser.add_argument("--verbose", type=str2bool, default=True, help="whether to print out the progress and debug messages")
-    parser.add_argument("--task", type=str, default="transcribe", choices=["transcribe", "translate"], help="whether to perform X->X speech recognition ('transcribe') or X->English translation ('translate')")
-    parser.add_argument("--language", type=str, default=None, choices=sorted(LANGUAGES.keys()) + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]), help="language spoken in the audio, specify None to perform language detection")
-    parser.add_argument("--threads", type=optional_int, default=0, help="number of threads used by torch for CPU inference; supercedes MKL_NUM_THREADS/OMP_NUM_THREADS")
-    parser.add_argument("--temperature", type=float, default=0, help="temperature to use for sampling")
-    parser.add_argument("--temperature_increment_on_fallback", type=optional_float, default=0.2, help="temperature to increase when falling back when the decoding fails to meet either of the thresholds below")
-    parser.add_argument("--logprob_threshold", type=optional_float, default=-0.57, help="if the average log probability is lower than this value, treat the decoding as failed")
-    parser.add_argument("--no_speech_threshold", type=optional_float, default=0.6, help="if the probability of the <|nospeech|> token is higher than this value AND the decoding has failed due to `logprob_threshold`, consider the segment as silence")
-    args = parser.parse_args().__dict__
-    model_name: str = args.pop("model")
-    model_dir: str = args.pop("model_dir")
-    output_dir: str = args.pop("output_dir")
-    output_format: str = args.pop("output_format")
-    device: str = args.pop("device")
-    os.makedirs(output_dir, exist_ok=True)
+    min_slices = max(1, _MIN_CHUNK_MS // _SEEK_STEP_MS)
+    max_slices = max(min_slices + 1, _MAX_CHUNK_MS // _SEEK_STEP_MS)
 
-    if model_name.endswith(".en") and args["language"] not in {"en", "English"}:
-        if args["language"] is not None:
-            warnings.warn(
-                f"{model_name} is an English-only model but receipted '{args['language']}'; using English instead."
+    cursor = 0
+    silent_skip_start: Optional[int] = None
+    chunks_yielded = 0
+    while cursor < n_slices:
+        probe_end = min(cursor + min_slices, n_slices)
+        if not bool(np.any(rms[cursor:probe_end] >= silence_rms)):
+            if silent_skip_start is None:
+                silent_skip_start = cursor
+            cursor = probe_end
+            continue
+        # The probe found speech somewhere in [cursor, probe_end);
+        # advance past any leading silence within that probe so the
+        # chunk starts at the first non-silent slice. The skipped
+        # silence is reported alongside any earlier accumulated
+        # silent skips.
+        speech_start = cursor
+        while speech_start < probe_end and rms[speech_start] < silence_rms:
+            speech_start += 1
+        if silent_skip_start is None:
+            silent_skip_start = cursor
+        cursor = speech_start
+        if silent_skip_start is not None and cursor > silent_skip_start:
+            skipped_ms = (cursor - silent_skip_start) * _SEEK_STEP_MS
+            vstderr(
+                f"chunker: skipped {skipped_ms / 1000.0:.1f}s of silence "
+                f"({_format_ts(silent_skip_start * _SEEK_STEP_MS / 1000.0)} -> "
+                f"{_format_ts(cursor * _SEEK_STEP_MS / 1000.0)})"
             )
-        args["language"] = "en"
+        silent_skip_start = None
+        chunk_start = cursor
+        look_lo = min(chunk_start + min_slices, n_slices)
+        look_hi = min(chunk_start + max_slices, n_slices)
+        if look_hi <= look_lo:
+            chunk_end = n_slices
+        else:
+            chunk_end = look_lo + int(np.argmin(rms[look_lo:look_hi]))
+        if chunk_end <= chunk_start:
+            chunk_end = min(chunk_start + 1, n_slices)
+        # Trim trailing silence: shrink the chunk back to the last
+        # non-silent slice so silence between speech bursts stays
+        # in the next iteration's silence-skip probe rather than
+        # getting sent to Whisper. Bounded below by min_slices to
+        # avoid degenerate zero-length chunks.
+        floor = min(chunk_start + min_slices, chunk_end)
+        trimmed_end = chunk_end
+        while trimmed_end > floor and rms[trimmed_end - 1] < silence_rms:
+            trimmed_end -= 1
+        if trimmed_end > chunk_start:
+            chunk_end = trimmed_end
+        chunk_start_ms = chunk_start * _SEEK_STEP_MS
+        chunk_end_ms = chunk_end * _SEEK_STEP_MS
+        chunks_yielded += 1
+        yield chunk_start_ms, chunk_end_ms, audio[chunk_start_ms:chunk_end_ms]
+        cursor = chunk_end
+    vstderr(
+        f"chunker: done, {chunks_yielded} chunks yielded "
+        f"(total {time.monotonic() - t0:.2f}s)"
+    )
 
 
-    temperature = args.pop("temperature")
-    if (increment := args.pop("temperature_increment_on_fallback")) is not None:
-        temperature = tuple(np.arange(temperature, 1.0 + 1e-6, increment))
+# ---------------------------------------------------------------------------
+# Cross-speaker merge
+# ---------------------------------------------------------------------------
+
+
+def merge_segments(per_speaker: list[list[dict]]) -> list[dict]:
+    """Sort all segments by start time and assign sequential ids.
+
+    Overlap RESOLUTION (cutting and word redistribution) lives
+    in `resolve_segment_overlaps` and runs once after this; the
+    merge itself just orders the streams.
+    """
+    all_segs = sorted(
+        (seg for spk in per_speaker for seg in spk),
+        key=lambda d: (d["start"], d["end"]),
+    )
+    for i, seg in enumerate(all_segs):
+        seg["id"] = i
+    return all_segs
+
+
+# ---------------------------------------------------------------------------
+# Global overlap resolution
+# ---------------------------------------------------------------------------
+
+
+def _retime(seg: dict, new_start: float, new_end: float) -> dict:
+    """Return a copy of `seg` with its timestamps clamped to
+    `[new_start, new_end]`. ALL words are preserved (overlap
+    resolution must never drop text); their timestamps are clamped
+    into the new range. Words whose original times fall entirely
+    outside the new window collapse to a zero-duration entry at the
+    nearest boundary, but their surface text is kept.
+    """
+    new_start = float(new_start)
+    new_end = float(new_end)
+    out = dict(seg)
+    out["start"] = new_start
+    out["end"] = new_end
+    out["seek"] = new_start
+    words = seg.get("words")
+    if words:
+        new_words = []
+        for w in words:
+            w2 = dict(w)
+            ws = max(new_start, min(new_end, float(w["start"])))
+            we = max(new_start, min(new_end, float(w["end"])))
+            if we < ws:
+                we = ws
+            w2["start"] = ws
+            w2["end"] = we
+            new_words.append(w2)
+        out["words"] = new_words
+        out["text"] = "".join(w.get("word", "") for w in new_words)
+    return out
+
+
+def _split_segment_3way(
+    seg: dict,
+    inner_start: float,
+    inner_end: float,
+) -> tuple[dict, dict]:
+    """Split `seg` (timed `[a, b]` containing `[inner_start, inner_end]`)
+    into a left half `[a, inner_start]` and a right half `[inner_end, b]`,
+    distributing its words by COUNT (per the user's formula):
+        xa = int(x * (mid - a) / (b - a))   with mid = (c + d) / 2
+        xb = x - xa
+    The first xa words go to the left half, the remaining xb to the
+    right half. If word timestamps are absent, words are split by
+    text length proportion using the same midpoint ratio.
+    """
+    a = float(seg["start"])
+    b = float(seg["end"])
+    c = float(inner_start)
+    d = float(inner_end)
+    mid = (c + d) / 2.0
+    span = max(b - a, 1e-9)
+    ratio = max(0.0, min(1.0, (mid - a) / span))
+
+    words = seg.get("words")
+    if words:
+        x = len(words)
+        xa = max(0, min(x, int(x * ratio)))
+        left_words = [dict(w) for w in words[:xa]]
+        right_words = [dict(w) for w in words[xa:]]
+        # Clamp word timestamps to the resulting segment ranges so
+        # writers don't surface impossible word times.
+        for w in left_words:
+            w["start"] = max(a, min(c, float(w["start"])))
+            w["end"] = max(a, min(c, float(w["end"])))
+        for w in right_words:
+            w["start"] = max(d, min(b, float(w["start"])))
+            w["end"] = max(d, min(b, float(w["end"])))
+        left_text = "".join(w.get("word", "") for w in left_words)
+        right_text = "".join(w.get("word", "") for w in right_words)
     else:
-        temperature = [temperature]
+        text = seg.get("text", "") or ""
+        cut = int(round(len(text) * ratio))
+        left_text = text[:cut]
+        right_text = text[cut:]
+        left_words = None
+        right_words = None
 
-    if (threads := args.pop("threads")) > 0:
-        torch.set_num_threads(threads)
+    left = dict(seg)
+    left["start"] = a
+    left["end"] = c
+    left["seek"] = a
+    left["text"] = left_text
+    left["words"] = left_words
 
-    audio_args = args.pop("audio_args")
+    right = dict(seg)
+    right["start"] = d
+    right["end"] = b
+    right["seek"] = d
+    right["text"] = right_text
+    right["words"] = right_words
+    return left, right
 
-    if(len(audio_args)%2 != 0):
-        raise Warning("Argument number should be even: speaker_name_1 audio_file_1 speaker_name_2 audio_file_2 …")
 
-    audio_dicts = []
-    for i in range(len(audio_args)//2):
-        audio_dict={}
-        audio_dict['speaker']=audio_args[i*2]
-        audio_dict['file_path']=audio_args[i*2+1]
-        audio_dicts.append(audio_dict)
+def resolve_segment_overlaps(segments: list[dict]) -> list[dict]:
+    """Apply the user's pairwise overlap rules in time order.
 
-    output_filename = audio_dicts[0]['file_path'][0:audio_dicts[0]['file_path'].rindex('.')]
-    for separator in ['_', '-', ' ', '.']:
-        try:
-            output_filename=output_filename[0:output_filename.rindex(separator)]
+    Notation: segment 1 = `[a, b]`, segment 2 = `[c, d]`, both
+    sorted such that `a <= c`.
+
+      * Rule (a): partial overlap (`a < c < b < d`) -> shrink each
+        side to the midpoint `m = (b + c) / 2`:
+            seg1 -> [a, m],  seg2 -> [m, d].
+
+      * Rule (b): full containment (`a < c < d < b`) -> split
+        seg1 in two pieces and keep seg2 in between:
+            [a, c]  +  [c, d] (seg2)  +  [d, b]
+        seg1's `x` words are distributed by count using
+        `xa = int(x * ((c + d)/2 - a) / (b - a))`.
+
+    Cross-speaker overlaps are resolved with the same rules
+    (per user direction). Zero-length segments produced by the
+    rules are filtered out.
+    """
+    if not segments:
+        return []
+    work = sorted(
+        (dict(s) for s in segments),
+        key=lambda s: (float(s["start"]), float(s["end"])),
+    )
+    out: list[dict] = []
+    while work:
+        s1 = work.pop(0)
+        if not work:
+            out.append(s1)
             break
-        except:
-            pass
+        s2 = work[0]
+        a = float(s1["start"])
+        b = float(s1["end"])
+        c = float(s2["start"])
+        d = float(s2["end"])
+        # No overlap: emit s1 as-is.
+        if b <= c:
+            out.append(s1)
+            continue
+        # Defensive: keep `a <= c` invariant.
+        if c < a:
+            # Shouldn't happen after sort, but if it did, swap.
+            s1, s2 = s2, s1
+            a, b, c, d = c, d, a, b
+        if d > b:
+            # Rule (a): partial overlap [a < c < b < d].
+            m = (b + c) / 2.0
+            out.append(_retime(s1, a, m))
+            new_s2 = _retime(s2, m, d)
+            work[0] = new_s2
+            continue
+        # Rule (b): full containment [a < c < d <= b].
+        left, right = _split_segment_3way(s1, c, d)
+        out.append(left)
+        # s2 stays as-is at the head of `work`. The right half of
+        # s1 must be re-inserted in time order so it gets compared
+        # against everything that follows s2.
+        _insert_sorted(work, right)
+    # Drop zero / negative duration leftovers; renumber ids.
+    out = [s for s in out if float(s["end"]) > float(s["start"])]
+    for i, s in enumerate(out):
+        s["id"] = i
+    return out
 
-    from whisper import load_model
 
-    model = load_model(model_name, device=device, download_root=model_dir)
-
-    writer = get_writer(output_format, output_dir)
-    result = transcribe(model, audio_dicts, temperature=temperature, **args)
-    writer(result, output_filename)
-
-
-
-if __name__ == "__main__":
-    cli()
-
+def _insert_sorted(work: list[dict], seg: dict) -> None:
+    """Insert `seg` into `work` keeping `work` sorted by start time
+    (then end time)."""
+    key = (float(seg["start"]), float(seg["end"]))
+    lo, hi = 0, len(work)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        cur = work[mid]
+        cur_key = (float(cur["start"]), float(cur["end"]))
+        if cur_key < key:
+            lo = mid + 1
+        else:
+            hi = mid
+    work.insert(lo, seg)

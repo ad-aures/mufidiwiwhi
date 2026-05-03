@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Mufidiwiwhi
+Comment=Multi-speaker podcast transcription
+Exec=mufidiwiwhi-gui %F
+Icon=mufidiwiwhi
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+MimeType=audio/wav;audio/flac;audio/mpeg;audio/ogg;
+StartupWMClass=mufidiwiwhi-gui

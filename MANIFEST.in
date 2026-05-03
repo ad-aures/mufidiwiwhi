@@ -1,0 +1,3 @@
+include README.md DOCS.md LICENSE mufidiwiwhi.svg
+recursive-include mufidiwiwhi/resources *.svg *.png *.md
+recursive-include packaging *.spec *.desktop *.md
