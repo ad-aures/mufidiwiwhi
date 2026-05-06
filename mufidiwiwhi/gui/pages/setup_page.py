@@ -137,7 +137,7 @@ class SetupPage(QWidget):
         bottom.addStretch(1)
         self.reset_btn = labeled_icon_button(
             self.tr("Reset to defaults"),
-            "chat-square-arrow-svgrepo-com.svg",
+            "eraser-svgrepo-com.svg",
             tooltip=self.tr(
                 "Restore the canned defaults for every field on this tab."
             ),
@@ -264,7 +264,7 @@ class SetupPage(QWidget):
         # Model cache dir (text field => EntryRow)
         self.model_dir_edit = QLineEdit()
         model_dir_btn = IconButton(
-            "folder.svg", tooltip=self.tr("Choose model cache directory...")
+            "add-folder-svgrepo-com.svg", tooltip=self.tr("Choose model cache directory...")
         )
         model_dir_btn.clicked.connect(
             lambda: self._pick_directory(
@@ -318,7 +318,7 @@ class SetupPage(QWidget):
 
         self.dictionary_edit = QLineEdit()
         dict_browse_btn = IconButton(
-            "folder.svg", tooltip=self.tr("Choose dictionary file...")
+            "add-folder-svgrepo-com.svg", tooltip=self.tr("Choose dictionary file...")
         )
         dict_browse_btn.clicked.connect(self._pick_dictionary)
         self.dict_edit_btn = IconButton(
@@ -400,7 +400,7 @@ class SetupPage(QWidget):
 
         self.hunspell_primary_edit = QLineEdit()
         hs_browse_btn = IconButton(
-            "folder.svg", tooltip=self.tr("Choose primary Hunspell dictionary...")
+            "add-folder-svgrepo-com.svg", tooltip=self.tr("Choose primary Hunspell dictionary...")
         )
         hs_browse_btn.clicked.connect(
             lambda: self._pick_hunspell(self.hunspell_primary_edit)
@@ -415,7 +415,7 @@ class SetupPage(QWidget):
 
         self.hunspell_secondary_edit = QLineEdit()
         hs2_browse_btn = IconButton(
-            "folder.svg", tooltip=self.tr("Choose secondary Hunspell dictionary...")
+            "add-folder-svgrepo-com.svg", tooltip=self.tr("Choose secondary Hunspell dictionary...")
         )
         hs2_browse_btn.clicked.connect(
             lambda: self._pick_hunspell(self.hunspell_secondary_edit)

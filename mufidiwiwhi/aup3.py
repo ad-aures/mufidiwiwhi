@@ -178,13 +178,26 @@ def extract_aup3(
     done_marker = os.path.join(dest_dir, _DONE_MARKER)
     manifest_path = os.path.join(dest_dir, _MANIFEST)
     if os.path.isfile(done_marker) and os.path.isfile(manifest_path):
-        _emit(log, f"Reusing cached aup3 extraction for {abs_path}")
-        with open(manifest_path, "r", encoding="utf-8") as fh:
-            entries = json.load(fh)
-        return [
-            SpeakerInput(speaker=e["speaker"], file_path=e["file_path"])
-            for e in entries
-        ]
+        # Cache is valid only if the source .aup3 hasn't been
+        # modified since extraction. The .done marker is written
+        # last, so its mtime represents extraction completion time.
+        if os.path.getmtime(abs_path) <= os.path.getmtime(done_marker):
+            _emit(log, f"Reusing cached aup3 extraction for {abs_path}")
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                entries = json.load(fh)
+            return [
+                SpeakerInput(speaker=e["speaker"], file_path=e["file_path"])
+                for e in entries
+            ]
+        _emit(
+            log,
+            f"Source .aup3 modified since last extraction; "
+            f"re-extracting {abs_path}",
+        )
+        try:
+            os.remove(done_marker)
+        except OSError:
+            pass
 
     os.makedirs(dest_dir, exist_ok=True)
     db = _open_readonly(abs_path)

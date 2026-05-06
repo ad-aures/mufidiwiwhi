@@ -114,7 +114,41 @@ The GUI also accepts the same arguments as the CLI to prefill the project tab:
 
 The Project tab has a **Copy CLI command** button that emits the full `mufidiwiwhi ...` invocation matching the current GUI state — the fastest way to learn the CLI flags.
 
-A PyInstaller spec is provided in `packaging/` for single-file Linux distribution.
+## Building a standalone binary (PyInstaller)
+
+Two PyInstaller specs ship in `packaging/`:
+
+- `mufidiwiwhi-gui-onefile.spec` &mdash; single self-extracting executable. Slower first launch (the bundle is unpacked to a temp dir on every run).
+- `mufidiwiwhi-gui-onedir.spec` &mdash; single folder of files. Faster startup, easier to debug, more files to ship.
+
+Whisper model weights and Hunspell dictionaries are NOT bundled. Models download to the user's huggingface cache on first use; Hunspell `.aff`/`.dic` files are read from `/usr/share/hunspell` (Linux) or wherever the platform installs them.
+
+### Linux
+
+    python3 -m venv env
+    . env/bin/activate
+    pip install -e . pyinstaller
+    pyinstaller packaging/mufidiwiwhi-gui-onefile.spec --noconfirm
+
+The binary lands in `dist/mufidiwiwhi-gui`. It runs on most x86_64 glibc distros from roughly the Ubuntu 22.04 era onward (build on the oldest distro you want to support &mdash; glibc is forward-compatible only).
+
+### macOS
+
+    python3 -m venv env
+    . env/bin/activate
+    pip install -e . pyinstaller
+    pyinstaller packaging/mufidiwiwhi-gui-onefile.spec --noconfirm
+
+Produces `dist/mufidiwiwhi-gui` (a Mach-O executable). To ship a `.app` bundle, swap `EXE(...)` for an `app = BUNDLE(exe, name='Mufidiwiwhi.app', icon='mufidiwiwhi.icns', bundle_identifier='org.podlibre.Mufidiwiwhi')` block in the spec. For Gatekeeper-friendly distribution, sign with a Developer ID certificate (`codesign --deep --sign "Developer ID Application: ..." Mufidiwiwhi.app`) and notarize via `xcrun notarytool`. ARM64 (Apple Silicon) and x86_64 are built natively on the matching host; for a universal2 binary, build on Apple Silicon with `target_arch='universal2'` and a universal2 Python.
+
+### Windows
+
+    py -3 -m venv env
+    env\Scripts\activate
+    pip install -e . pyinstaller
+    pyinstaller packaging\mufidiwiwhi-gui-onefile.spec --noconfirm
+
+Produces `dist\mufidiwiwhi-gui.exe`. `ffmpeg.exe` must be on `PATH` at runtime; the easiest way is `winget install Gyan.FFmpeg` or shipping `ffmpeg.exe` next to the binary. For a signed installer, wrap the output with [Inno Setup](https://jrsoftware.org/isinfo.php) or [NSIS](https://nsis.sourceforge.io/).
 
 ## Dependencies
 
@@ -134,7 +168,7 @@ Runtime:
 Build / dev:
 
 - [pytest](https://pytest.org/) &mdash; test runner.
-- [PyInstaller](https://pyinstaller.org/) &mdash; standalone Linux binary builds.
+- [PyInstaller](https://pyinstaller.org/) &mdash; standalone binary builds for Linux, macOS, and Windows.
 
 External tools:
 

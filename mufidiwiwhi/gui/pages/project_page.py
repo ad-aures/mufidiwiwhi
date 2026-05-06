@@ -152,7 +152,7 @@ class ProjectPage(QWidget):
 
         self.output_dir_edit = QLineEdit()
         out_btn = IconButton(
-            "folder.svg", tooltip=self.tr("Choose output directory...")
+            "add-folder-svgrepo-com.svg", tooltip=self.tr("Choose output directory...")
         )
         out_btn.clicked.connect(self._pick_output_dir)
         card.add_row(
