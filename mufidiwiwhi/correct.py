@@ -234,10 +234,12 @@ class CorrectionState:
             self.user_dict_surfaces = surfaces
 
 
-def _entry_codes(tokens: Sequence[str], lang: str) -> set[str]:
+def _entry_codes(
+    tokens: Sequence[str], lang: str, clitic: str = ""
+) -> set[str]:
     """Return the set of phonetic codes that should index a dict entry.
 
-    We index each entry under TWO variants so it matches whether the
+    We index each entry under three variants so it matches whether the
     speech recogniser produced the same word boundaries as the
     dictionary or not:
 
@@ -247,8 +249,15 @@ def _entry_codes(tokens: Sequence[str], lang: str) -> set[str]:
         Whisper merged the words, e.g. dict has "OpenRAG" and the
         transcript has "openrag" as a single token, OR dict has
         "open rag" written as 2 tokens but Whisper produced 1)
+      * clitic-merged: for entries with an apostrophe-clitic prefix
+        (l'ANTS, d'Aures, D'Échirolles, ...) we also register the
+        phonetic of the un-elided surface, i.e. the clitic letter
+        glued to the body ("lants", "dechirolles"). Whisper often
+        writes the un-contracted preposition as a separate word
+        ("la NTS" -> l'ANTS, "Des Chirolle" -> D'Échirolles), and
+        this code variant catches that.
 
-    Both forms are useful because Whisper word boundaries are not
+    All forms are useful because Whisper word boundaries are not
     stable for proper nouns and made-up words.
     """
     out: set[str] = set()
@@ -261,6 +270,13 @@ def _entry_codes(tokens: Sequence[str], lang: str) -> set[str]:
             collapsed_code = _phonetic_token(collapsed, lang)
             if collapsed_code:
                 out.add(collapsed_code)
+    if clitic:
+        clitic_letter = clitic[0] if clitic[0].isalpha() else ""
+        if clitic_letter:
+            merged = clitic_letter + "".join(tokens)
+            merged_code = _phonetic_token(merged, lang)
+            if merged_code:
+                out.add(merged_code)
     return out
 
 
@@ -333,7 +349,7 @@ def load_dictionary(path: str, cfg: CorrectionConfig) -> PhoneticIndex:
             if line.lstrip().startswith("#"):
                 continue
             canonical = line.strip()
-            tokens = _tokens_for_entry(canonical)
+            tokens, clitic = _normalise_text_to_tokens(canonical)
             if not tokens:
                 continue
             n = len(tokens)
@@ -352,9 +368,9 @@ def load_dictionary(path: str, cfg: CorrectionConfig) -> PhoneticIndex:
                 code_primary=code_primary,
                 code_secondary=code_secondary,
             )
-            codes = _entry_codes(tokens, primary_lang)
+            codes = _entry_codes(tokens, primary_lang, clitic=clitic)
             if secondary_lang:
-                codes |= _entry_codes(tokens, secondary_lang)
+                codes |= _entry_codes(tokens, secondary_lang, clitic=clitic)
             for code in codes:
                 by_code.setdefault(code, []).append(entry)
             if n > max_n:
@@ -447,6 +463,33 @@ def _is_function_word(token: str, lang: Optional[str]) -> bool:
     if not table:
         return False
     return token.lower() in table
+
+
+# French determiners that contract before a vowel-initial word:
+# "le ANCT" -> "l'ANCT", "la NCT" -> "l'ANCT", "de Aures" -> "d'Aures",
+# "ce ANCT" -> "c'ANCT". Each maps to its contracted form including
+# the apostrophe. Only French; English determiners don't elide this
+# way. Kept tight on purpose — broader lists (que, ne, me, te, se,
+# je) precede verbs in practice and would over-fire on proper-noun
+# replacement.
+_FR_CONTRACTABLE_DETERMINERS: dict[str, str] = {
+    "le": "l'",
+    "la": "l'",
+    "de": "d'",
+    "ce": "c'",
+}
+
+_VOWELS = frozenset("aeiouyàâéèêëïîôûùüœæAEIOUYÀÂÉÈÊËÏÎÔÛÙÜŒÆ")
+
+
+def _starts_with_vowel(text: str) -> bool:
+    """True when `text` begins with a French/English vowel after
+    stripping any leading apostrophe-clitic prefix.
+    """
+    s = text.strip()
+    if len(s) >= 2 and s[1] in ("'", "’"):
+        s = s[2:].lstrip()
+    return bool(s) and s[0] in _VOWELS
 
 
 def _sub_window_already_matches(
@@ -758,16 +801,47 @@ def _decide(
         #       the entry essentially exactly — the bigger match is
         #       just eating unrelated content words ("part" in
         #       "part framasoft").
-        # EXCEPTION: when the dict entry's canonical starts with an
+        # EXCEPTION 1: when the dict entry's canonical starts with an
         # apostrophe-clitic ("l'ANTS", "d'Aures", ...), the leading
         # function word IS expected to be consumed, because the
         # clitic IS the contracted form of the article. Allow it.
+        # EXCEPTION 2: when the entry's surface is the TAIL of the
+        # joined input surface (so the leading tokens just prepend
+        # extra letters in front of the entry, not noise mixed
+        # throughout), the joined-surface edit distance is at most
+        # 1, and joining doesn't make the match worse than any
+        # sub-window alone, the leading word is part of the proper
+        # noun's pronunciation (e.g. "à Eris" -> "Aeris", or
+        # "la NCT" with "ANCT" in the dictionary). Without this
+        # bypass the matcher leaves the stray leading word in front
+        # of the replaced tail.
         # In every other case the smaller window gets a chance on
         # the next iteration of the outer matcher loop.
         if entry.n >= len(input_tokens):
             return False
         if _entry_has_clitic_prefix(entry):
             return False
+        entry_surface = _surface_normalize("".join(entry.tokens))
+        joined_surface = _surface_normalize("".join(input_tokens))
+        if (
+            entry_surface
+            and joined_surface
+            and len(joined_surface) >= len(entry_surface)
+            and joined_surface.endswith(entry_surface)
+        ):
+            joined_edit = _levenshtein(joined_surface, entry_surface)
+            if joined_edit <= 1:
+                best_sub_edit: Optional[int] = None
+                for start in range(len(input_tokens) - entry.n + 1):
+                    sub = input_tokens[start : start + entry.n]
+                    sub_surface = _surface_normalize("".join(sub))
+                    if not sub_surface:
+                        continue
+                    d = _levenshtein(sub_surface, entry_surface)
+                    if best_sub_edit is None or d < best_sub_edit:
+                        best_sub_edit = d
+                if best_sub_edit is None or joined_edit <= best_sub_edit:
+                    return False
         if _has_short_or_function_word(input_tokens, lang):
             return True
         if _sub_window_already_matches(entry, input_tokens):
@@ -1016,6 +1090,24 @@ def _correct_segment(
             if chosen.tokens == tuple(tokens_collected):
                 if chosen.canonical == original_surface:
                     continue
+            # French clitic synthesis: when the matcher absorbed a
+            # leading contractable determiner ("le", "la", "de",
+            # "ce") and the canonical begins with a vowel, emit the
+            # contracted clitic. "la NCT" with "ANCT" in the dict
+            # becomes "l'ANCT", not "ANCT" with the "la" silently
+            # eaten.
+            if (
+                active_lang == "fr"
+                and not leading_clitic
+                and chosen.n < len(tokens_collected)
+                and len(tokens_collected) - chosen.n == 1
+                and not _entry_has_clitic_prefix(chosen)
+            ):
+                contraction = _FR_CONTRACTABLE_DETERMINERS.get(
+                    tokens_collected[0]
+                )
+                if contraction and _starts_with_vowel(chosen.canonical):
+                    leading_clitic = contraction
             new_word = _merge_window_into_word(
                 window, chosen.canonical, leading_clitic
             )
