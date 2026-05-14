@@ -262,35 +262,65 @@ def run_pipeline(
 
         correction_state = _c.build_correction_state(cfg.correction, log=log)
 
-    per_speaker: list[list[dict]] = []
     n = len(cfg.speakers)
-    for idx, spk in enumerate(cfg.speakers):
-        if check_cancel():
-            raise Cancelled()
-        emit_log("")  # blank separator line in the log
+    # Orchestrator dispatch. The default is the legacy serial path
+    # (process speaker 1 end-to-end, then speaker 2, ...) so existing
+    # runs are unchanged. Opt into the chunk-interleaved orchestrator
+    # by exporting MUFIDIWIWHI_PARALLEL_ORCHESTRATOR=1. The flag is
+    # temporary while the new path is being validated; once it is the
+    # default, the legacy branch and the flag will be removed.
+    use_parallel = os.environ.get(
+        "MUFIDIWIWHI_PARALLEL_ORCHESTRATOR", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if use_parallel:
+        emit_log("")
         emit_log(
-            f"=== Speaker {idx + 1}/{n}: {spk.speaker} "
-            f"({spk.file_path}) ==="
+            f"=== Parallel orchestrator: {n} "
+            f"speaker{'s' if n != 1 else ''} interleaved by chunk ==="
         )
+        from . import orchestrator as _o
 
-        def on_segment_progress(frac: float, _spk=spk) -> None:
-            if progress is not None:
-                progress(f"Transcribing {_spk.speaker}", frac)
-
-        segments = _t.transcribe_speaker(
+        tracks = _o.init_tracks(cfg.speakers, cfg, log=log)
+        flat = _o.run_parallel(
+            tracks,
             model,
-            spk.file_path,
-            spk.speaker,
             cfg,
+            correction_state=correction_state,
             log=log,
             log_html=log_html,
             cancel=cancel,
-            progress=on_segment_progress,
-            correction_state=correction_state,
+            progress=progress,
         )
-        per_speaker.append(segments)
-        if progress is not None:
-            progress("Transcribing", (idx + 1) / n)
+        per_speaker = [flat]
+    else:
+        per_speaker = []
+        for idx, spk in enumerate(cfg.speakers):
+            if check_cancel():
+                raise Cancelled()
+            emit_log("")  # blank separator line in the log
+            emit_log(
+                f"=== Speaker {idx + 1}/{n}: {spk.speaker} "
+                f"({spk.file_path}) ==="
+            )
+
+            def on_segment_progress(frac: float, _spk=spk) -> None:
+                if progress is not None:
+                    progress(f"Transcribing {_spk.speaker}", frac)
+
+            segments = _t.transcribe_speaker(
+                model,
+                spk.file_path,
+                spk.speaker,
+                cfg,
+                log=log,
+                log_html=log_html,
+                cancel=cancel,
+                progress=on_segment_progress,
+                correction_state=correction_state,
+            )
+            per_speaker.append(segments)
+            if progress is not None:
+                progress("Transcribing", (idx + 1) / n)
 
     if check_cancel():
         raise Cancelled()
