@@ -70,6 +70,10 @@ _TARGET_SAMPWIDTH = 2  # 16-bit PCM
 _DONE_MARKER = ".done"
 _MANIFEST = "manifest.json"
 _SUBDIR_SUFFIX = "_tracks"
+# Bump when the extractor's output semantics change so stale caches
+# from older versions are invalidated even though the source .aup3
+# mtime hasn't moved. v2: per-track sample rate (was project rate).
+_EXTRACTOR_VERSION = 2
 
 
 def is_aup3(path: str) -> bool:
@@ -179,21 +183,44 @@ def extract_aup3(
     manifest_path = os.path.join(dest_dir, _MANIFEST)
     if os.path.isfile(done_marker) and os.path.isfile(manifest_path):
         # Cache is valid only if the source .aup3 hasn't been
-        # modified since extraction. The .done marker is written
-        # last, so its mtime represents extraction completion time.
-        if os.path.getmtime(abs_path) <= os.path.getmtime(done_marker):
-            _emit(log, f"Reusing cached aup3 extraction for {abs_path}")
-            with open(manifest_path, "r", encoding="utf-8") as fh:
-                entries = json.load(fh)
-            return [
-                SpeakerInput(speaker=e["speaker"], file_path=e["file_path"])
-                for e in entries
-            ]
-        _emit(
-            log,
-            f"Source .aup3 modified since last extraction; "
-            f"re-extracting {abs_path}",
+        # modified since extraction AND the manifest was written
+        # by the current extractor version. The .done marker is
+        # written last, so its mtime represents extraction
+        # completion time.
+        cache_fresh = (
+            os.path.getmtime(abs_path) <= os.path.getmtime(done_marker)
         )
+        if cache_fresh:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                manifest = json.load(fh)
+            # v1 wrote a bare list of entries; v2+ wraps them in
+            # {"version": N, "entries": [...]}. Treat anything not
+            # matching the current version as stale.
+            if (
+                isinstance(manifest, dict)
+                and manifest.get("version") == _EXTRACTOR_VERSION
+            ):
+                _emit(
+                    log,
+                    f"Reusing cached aup3 extraction for {abs_path}",
+                )
+                return [
+                    SpeakerInput(
+                        speaker=e["speaker"], file_path=e["file_path"]
+                    )
+                    for e in manifest["entries"]
+                ]
+            _emit(
+                log,
+                f"Cached aup3 extraction is from an older extractor "
+                f"version; re-extracting {abs_path}",
+            )
+        else:
+            _emit(
+                log,
+                f"Source .aup3 modified since last extraction; "
+                f"re-extracting {abs_path}",
+            )
         try:
             os.remove(done_marker)
         except OSError:
@@ -211,10 +238,13 @@ def extract_aup3(
 
     with open(manifest_path, "w", encoding="utf-8") as fh:
         json.dump(
-            [
-                {"speaker": s.speaker, "file_path": s.file_path}
-                for s in speakers
-            ],
+            {
+                "version": _EXTRACTOR_VERSION,
+                "entries": [
+                    {"speaker": s.speaker, "file_path": s.file_path}
+                    for s in speakers
+                ],
+            },
             fh,
         )
     open(done_marker, "w").close()
@@ -275,22 +305,30 @@ def _extract(db, dest_dir: str, log: Optional[LogCb]) -> list[SpeakerInput]:
             speaker = base_name
             filename = base_name
         out_path = os.path.join(dest_dir, f"{filename}.wav")
+        # Audacity stores a per-track sample rate on each WaveTrack.
+        # Using the project's default rate for every track corrupts
+        # tracks imported at a different rate (e.g. 48 kHz audio in
+        # a 44.1 kHz project plays ~8.8% slow, and clip trim values
+        # land on the wrong sample boundary).
+        track_rate = int(
+            round(float(_attr(left, "rate", project_rate)))
+        )
         _emit(
             log,
             f"Extracting aup3 track {idx + 1}/{len(pairs)}: {speaker} "
-            f"(rate {project_rate} Hz, "
+            f"(rate {track_rate} Hz, "
             f"{'stereo' if right is not None else 'mono'})",
         )
-        left_samples = _track_samples(db, left, project_rate, log)
+        left_samples = _track_samples(db, left, track_rate, log)
         if right is not None:
-            right_samples = _track_samples(db, right, project_rate, log)
+            right_samples = _track_samples(db, right, track_rate, log)
             length = max(len(left_samples), len(right_samples))
             left_samples = _pad_to(left_samples, length)
             right_samples = _pad_to(right_samples, length)
             mono = (left_samples + right_samples) * 0.5
         else:
             mono = left_samples
-        resampled = _resample_to_16k(mono, project_rate)
+        resampled = _resample_to_16k(mono, track_rate)
         _write_wav(out_path, resampled)
         speakers.append(SpeakerInput(speaker=speaker, file_path=out_path))
 
@@ -298,7 +336,7 @@ def _extract(db, dest_dir: str, log: Optional[LogCb]) -> list[SpeakerInput]:
 
 
 def _track_samples(
-    db, track, project_rate: int, log: Optional[LogCb]
+    db, track, track_rate: int, log: Optional[LogCb]
 ) -> np.ndarray:
     """Decode one wavetrack Element to a float32 timeline.
 
@@ -330,9 +368,9 @@ def _track_samples(
         offset_s = float(_attr(clip, "offset", 0.0) or 0.0)
         trim_left_s = float(_attr(clip, "trimLeft", 0.0) or 0.0)
         trim_right_s = float(_attr(clip, "trimRight", 0.0) or 0.0)
-        offset_samples = int(round(offset_s * project_rate))
-        trim_left_samples = max(0, int(round(trim_left_s * project_rate)))
-        trim_right_samples = max(0, int(round(trim_right_s * project_rate)))
+        offset_samples = int(round(offset_s * track_rate))
+        trim_left_samples = max(0, int(round(trim_left_s * track_rate)))
+        trim_right_samples = max(0, int(round(trim_right_s * track_rate)))
 
         clip_blocks: list[tuple[int, np.ndarray]] = []
         clip_local_end = 0
