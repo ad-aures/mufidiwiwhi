@@ -421,83 +421,139 @@ def transcribe_speaker(
         if cancel and cancel():
             raise Cancelled()
         chunk_index += 1
-        offset_s = chunk_start_ms / 1000.0
-        chunk_dur_s = (chunk_end_ms - chunk_start_ms) / 1000.0
-        vstderr(
-            f"[{speaker}] chunk {chunk_index}: "
-            f"{_format_ts(chunk_start_ms / 1000.0)} -> "
-            f"{_format_ts(chunk_end_ms / 1000.0)} "
-            f"({chunk_dur_s:.1f}s) decoding..."
+        chunk_segs, detected_language = process_chunk(
+            model,
+            speaker,
+            chunk_index,
+            chunk_start_ms,
+            chunk_end_ms,
+            chunk_audio,
+            cfg,
+            len(out),
+            detected_language,
+            correction_state=correction_state,
+            log=log,
+            log_html=log_html,
+            cancel=cancel,
         )
-        t_chunk = time.monotonic()
-        samples = _audiosegment_to_float32(chunk_audio)
-        t_whisper_start = time.monotonic()
-        segments_iter, info = model.transcribe(
-            samples,
-            language=cfg.language,
-            task=cfg.task,
-            initial_prompt=cfg.initial_prompt,
-            temperature=cfg.temperature,
-            # Disable Whisper's segment-drop filters. The chunker
-            # has already decided this chunk contains speech (via
-            # the RMS test), so we trust that and force Whisper to
-            # emit a transcription for every sample. Whisper's own
-            # `log_prob_threshold` / `no_speech_threshold` are
-            # opinionated quality gates that drop any segment the
-            # decoder isn't sure about, including real but quiet
-            # speech. Compression-ratio filtering stays on because
-            # it catches genuine hallucination loops (e.g. the
-            # "thanks for watching" repeats), not silence.
-            log_prob_threshold=None,
-            no_speech_threshold=1.0,
-            compression_ratio_threshold=cfg.compression_ratio_threshold,
-            condition_on_previous_text=cfg.condition_on_previous_text,
-            word_timestamps=cfg.word_timestamps,
-            vad_filter=False,
-        )
-        if detected_language is None:
-            detected_language = getattr(info, "language", None)
-        chunk_seg_count = 0
-        for s in segments_iter:
-            if cancel and cancel():
-                raise Cancelled()
-            chunk_seg_count += 1
-            seg_dict = _build_segment_dict(
-                s, speaker, cfg, len(out), offset_s, detected_language
-            )
-            if correction_state is not None:
-                try:
-                    from . import correct as _c
-
-                    t_corr = time.monotonic()
-                    _c.correct_segment_in_place(seg_dict, correction_state)
-                    corr_dt = time.monotonic() - t_corr
-                    if corr_dt > 1.0:
-                        vstderr(
-                            f"[{speaker}] chunk {chunk_index} seg "
-                            f"{seg_dict['id']}: correction took "
-                            f"{corr_dt:.2f}s"
-                        )
-                except Exception as exc:
-                    if log is not None:
-                        log(
-                            f"Per-chunk correction failed on segment "
-                            f"{seg_dict['id']}: {exc}"
-                        )
-            out.append(seg_dict)
-            _emit_segment_log(seg_dict, speaker, cfg, log, log_html)
-        chunk_dt = time.monotonic() - t_chunk
-        whisper_dt = time.monotonic() - t_whisper_start
-        vstderr(
-            f"[{speaker}] chunk {chunk_index}: done in {chunk_dt:.2f}s "
-            f"({chunk_seg_count} segments, whisper {whisper_dt:.2f}s)"
-        )
+        out.extend(chunk_segs)
         if progress is not None and total_ms > 0:
             progress(min(1.0, chunk_end_ms / total_ms))
 
     if log is not None:
         log(f"Finished '{speaker}': {len(out)} segments")
     return out
+
+
+def process_chunk(
+    model: Any,
+    speaker: str,
+    chunk_index: int,
+    chunk_start_ms: int,
+    chunk_end_ms: int,
+    chunk_audio: Any,
+    cfg: RunConfig,
+    base_seg_id: int,
+    detected_language: Optional[str],
+    *,
+    correction_state: Any = None,
+    log: Optional[LogCb] = None,
+    log_html: Optional[LogCb] = None,
+    cancel: Optional[CancelCb] = None,
+) -> tuple[list[dict], Optional[str]]:
+    """Run Whisper on one already-cut chunk and return its segments.
+
+    Pure reusable wrapper around the per-chunk inner loop that used
+    to live inline in `transcribe_speaker`. Behaviour is identical:
+    same `model.transcribe(...)` parameters, same per-segment
+    correction pass via `correct_segment_in_place`, same log
+    emissions, same `Cancelled` semantics.
+
+    Returns `(segments, detected_language)`. `detected_language` is
+    auto-filled from Whisper's `info.language` when the caller
+    passes `None` for it, otherwise it is returned unchanged so
+    callers can carry it forward across chunks.
+    """
+    if cancel and cancel():
+        raise Cancelled()
+    offset_s = chunk_start_ms / 1000.0
+    chunk_dur_s = (chunk_end_ms - chunk_start_ms) / 1000.0
+    vstderr(
+        f"[{speaker}] chunk {chunk_index}: "
+        f"{_format_ts(chunk_start_ms / 1000.0)} -> "
+        f"{_format_ts(chunk_end_ms / 1000.0)} "
+        f"({chunk_dur_s:.1f}s) decoding..."
+    )
+    t_chunk = time.monotonic()
+    samples = _audiosegment_to_float32(chunk_audio)
+    t_whisper_start = time.monotonic()
+    segments_iter, info = model.transcribe(
+        samples,
+        language=cfg.language,
+        task=cfg.task,
+        initial_prompt=cfg.initial_prompt,
+        temperature=cfg.temperature,
+        # Disable Whisper's segment-drop filters. The chunker
+        # has already decided this chunk contains speech (via
+        # the RMS test), so we trust that and force Whisper to
+        # emit a transcription for every sample. Whisper's own
+        # `log_prob_threshold` / `no_speech_threshold` are
+        # opinionated quality gates that drop any segment the
+        # decoder isn't sure about, including real but quiet
+        # speech. Compression-ratio filtering stays on because
+        # it catches genuine hallucination loops (e.g. the
+        # "thanks for watching" repeats), not silence.
+        log_prob_threshold=None,
+        no_speech_threshold=1.0,
+        compression_ratio_threshold=cfg.compression_ratio_threshold,
+        condition_on_previous_text=cfg.condition_on_previous_text,
+        word_timestamps=cfg.word_timestamps,
+        vad_filter=False,
+    )
+    if detected_language is None:
+        detected_language = getattr(info, "language", None)
+    out: list[dict] = []
+    chunk_seg_count = 0
+    for s in segments_iter:
+        if cancel and cancel():
+            raise Cancelled()
+        chunk_seg_count += 1
+        seg_dict = _build_segment_dict(
+            s,
+            speaker,
+            cfg,
+            base_seg_id + chunk_seg_count - 1,
+            offset_s,
+            detected_language,
+        )
+        if correction_state is not None:
+            try:
+                from . import correct as _c
+
+                t_corr = time.monotonic()
+                _c.correct_segment_in_place(seg_dict, correction_state)
+                corr_dt = time.monotonic() - t_corr
+                if corr_dt > 1.0:
+                    vstderr(
+                        f"[{speaker}] chunk {chunk_index} seg "
+                        f"{seg_dict['id']}: correction took "
+                        f"{corr_dt:.2f}s"
+                    )
+            except Exception as exc:
+                if log is not None:
+                    log(
+                        f"Per-chunk correction failed on segment "
+                        f"{seg_dict['id']}: {exc}"
+                    )
+        out.append(seg_dict)
+        _emit_segment_log(seg_dict, speaker, cfg, log, log_html)
+    chunk_dt = time.monotonic() - t_chunk
+    whisper_dt = time.monotonic() - t_whisper_start
+    vstderr(
+        f"[{speaker}] chunk {chunk_index}: done in {chunk_dt:.2f}s "
+        f"({chunk_seg_count} segments, whisper {whisper_dt:.2f}s)"
+    )
+    return out, detected_language
 
 
 def _iter_chunks_from(
