@@ -15,10 +15,9 @@
 
 """Project tab, GNOME-49 / libadwaita styled.
 
-Per-run inputs only: speaker table, output settings, and a small
-hint about the corrector. Three cards, in order: Speakers, Output,
-Correction. Run + Copy CLI buttons sit in a bottom row outside any
-card.
+Per-run inputs only: speaker table and output settings. Two cards,
+in order: Speakers, Output. Run + Copy CLI buttons sit in a bottom
+row outside any card.
 """
 
 from __future__ import annotations
@@ -64,14 +63,8 @@ from ..widgets.speaker_list import SpeakerListView
 from ..widgets.speaker_table import SpeakerTableModel
 
 
-def _set_tone(widget: QWidget, tone: str) -> None:
-    widget.setProperty("tone", tone)
-    widget.style().unpolish(widget)
-    widget.style().polish(widget)
-
-
 class ProjectPage(QWidget):
-    """Per-run inputs: speakers, output, and correction hint."""
+    """Per-run inputs: speakers and output."""
 
     runRequested = pyqtSignal(object)  # emits a RunConfig
 
@@ -82,7 +75,6 @@ class ProjectPage(QWidget):
         self._connect()
         self._restore_last_session()
         self._refresh_run_button()
-        self._refresh_correction_hints()
 
     # ----- UI ------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -99,7 +91,6 @@ class ProjectPage(QWidget):
 
         self._add_section(outer, self.tr("Speakers"), self._speakers_card())
         self._add_section(outer, self.tr("Output"), self._output_card())
-        self._add_section(outer, self.tr("Correction"), self._correction_card())
         outer.addStretch(1)
 
         scroll = QScrollArea(self)
@@ -241,38 +232,6 @@ class ProjectPage(QWidget):
         if tooltip:
             btn.setToolTip(tooltip)
         return btn
-
-    # ----- Correction card -----------------------------------------------
-    def _correction_card(self) -> CardFrame:
-        card = CardFrame()
-
-        info_row = QFrame()
-        info_row.setProperty("class", "row")
-        info_layout = QHBoxLayout(info_row)
-        info_layout.setContentsMargins(16, 12, 16, 12)
-        info = QLabel(
-            self.tr(
-                "Phonetic and confidence-based correction runs "
-                "automatically when a dictionary is configured on the "
-                "Settings tab."
-            )
-        )
-        info.setWordWrap(True)
-        info_layout.addWidget(info, stretch=1)
-        card.add_row(info_row)
-
-        hint_row = QFrame()
-        hint_row.setProperty("class", "row")
-        hint_layout = QHBoxLayout(hint_row)
-        hint_layout.setContentsMargins(16, 12, 16, 12)
-        self.phonetic_hint = QLabel()
-        self.phonetic_hint.setWordWrap(True)
-        self.phonetic_hint.setIndent(0)
-        _set_tone(self.phonetic_hint, "muted")
-        hint_layout.addWidget(self.phonetic_hint, stretch=1)
-        card.add_row(hint_row)
-
-        return card
 
     def _bottom_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -488,28 +447,6 @@ class ProjectPage(QWidget):
             out.append("tsv")
         return out or ["srt"]
 
-    # ----- correction hints (refreshed when the page becomes visible) ---
-    def showEvent(self, event) -> None:  # noqa: D401
-        super().showEvent(event)
-        self._refresh_correction_hints()
-
-    def _refresh_correction_hints(self) -> None:
-        gs = self._settings.load_global()
-        if gs.dictionary_path:
-            self.phonetic_hint.setText(
-                self.tr("Using dictionary: {0}").format(gs.dictionary_path)
-            )
-            _set_tone(self.phonetic_hint, "muted")
-        else:
-            self.phonetic_hint.setText(
-                self.tr(
-                    "No dictionary set. Open the Settings tab and "
-                    "click 'Edit...' to create one (correction will be "
-                    "skipped until then)."
-                )
-            )
-            _set_tone(self.phonetic_hint, "warn")
-
     # ----- Run -----------------------------------------------------------
     def _on_run_clicked(self) -> None:
         cfg = self.build_run_config()
@@ -661,4 +598,3 @@ class ProjectPage(QWidget):
             self._auto_outdir()
         self._auto_filename()
         self._refresh_run_button()
-        self._refresh_correction_hints()
