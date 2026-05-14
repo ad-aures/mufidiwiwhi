@@ -263,16 +263,16 @@ def run_pipeline(
         correction_state = _c.build_correction_state(cfg.correction, log=log)
 
     n = len(cfg.speakers)
-    # Orchestrator dispatch. The default is the legacy serial path
-    # (process speaker 1 end-to-end, then speaker 2, ...) so existing
-    # runs are unchanged. Opt into the chunk-interleaved orchestrator
-    # by exporting MUFIDIWIWHI_PARALLEL_ORCHESTRATOR=1. The flag is
-    # temporary while the new path is being validated; once it is the
-    # default, the legacy branch and the flag will be removed.
-    use_parallel = os.environ.get(
-        "MUFIDIWIWHI_PARALLEL_ORCHESTRATOR", ""
+    # Orchestrator dispatch. The default is the chunk-interleaved
+    # orchestrator, which advances every speaker track in lockstep
+    # by chunk start time. Export MUFIDIWIWHI_LEGACY_ORCHESTRATOR=1
+    # to opt back into the per-speaker serial loop for A/B
+    # comparison; that branch will be removed once the parallel
+    # path has been validated against real podcast inputs.
+    use_legacy = os.environ.get(
+        "MUFIDIWIWHI_LEGACY_ORCHESTRATOR", ""
     ).strip().lower() in ("1", "true", "yes", "on")
-    if use_parallel:
+    if not use_legacy:
         emit_log("")
         emit_log(
             f"=== Parallel orchestrator: {n} "
