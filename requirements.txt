@@ -3,11 +3,13 @@ numpy>=1.24
 scipy>=1.10
 aup3>=1.0.1
 pydub>=0.25
+audioop-lts>=0.2.2; python_version >= "3.13"
 phonetic-fr>=1.0
 metaphone>=0.6
 jellyfish>=1.0
 spylls>=0.1.7
 psutil>=5.9
 nvidia-ml-py>=12
+nvidia-cublas-cu12>=12; sys_platform == "linux" and platform_machine == "x86_64"
 PyQt6>=6.7
 pyinstaller>=6

@@ -17,6 +17,40 @@
 
 __version__ = "2.1.0"
 
+
+def _preload_cublas() -> None:
+    # ctranslate2 dlopens libcublas.so.12 lazily and relies on the
+    # dynamic loader. The nvidia-cublas-cu12 wheel ships the .so files
+    # but does not register them on the loader path, so without torch
+    # (whose RPATH does it as a side-effect) the dlopen fails. Load
+    # them ourselves here so ctranslate2's later dlopen succeeds.
+    import ctypes
+    import os
+    import sys
+
+    if sys.platform != "linux":
+        return
+    try:
+        import nvidia.cublas as _cublas_pkg
+    except ImportError:
+        return
+    pkg_path = getattr(_cublas_pkg, "__path__", None)
+    if not pkg_path:
+        return
+    lib_dir = os.path.join(next(iter(pkg_path)), "lib")
+    for name in ("libcublasLt.so.12", "libcublas.so.12"):
+        path = os.path.join(lib_dir, name)
+        if os.path.exists(path):
+            try:
+                ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+_preload_cublas()
+del _preload_cublas
+
+
 from .core import (
     Cancelled,
     CorrectionConfig,
